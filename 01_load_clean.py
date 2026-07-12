@@ -16,7 +16,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from utils import load_buoy_series, default_paths, count_raw_duplicate_timestamps
+from utils import load_buoy_series, default_paths, count_raw_duplicate_timestamps, detect_available_variables
 
 MAX_REASONABLE_VHM0 = 15.0  # meters; North Sea storm Hs rarely exceeds this
 SHORT_GAP_LIMIT = 3         # interpolate gaps up to this many samples; longer -> segment
@@ -82,10 +82,14 @@ def main():
 
     nc_path = args.data_dir / f"{args.buoy}.nc"
     n_duplicates_raw = count_raw_duplicate_timestamps(nc_path)
+    available_vars = detect_available_variables(nc_path)
     s = load_buoy_series(nc_path, args.var)
 
     s_clean, report = regularize_and_clean(s, args.var)
     report["n_duplicate_timestamps_raw"] = n_duplicates_raw
+    report["available_variables"] = available_vars
+    report["record_years"] = round(
+        (s_clean.index[-1] - s_clean.index[0]).total_seconds() / (3600 * 24 * 365.25), 4)
 
     out_dir = default_paths("01_load_clean")
     s_clean.to_csv(out_dir / f"{args.buoy}_{args.var}_clean.csv", header=[args.var])

@@ -110,6 +110,7 @@ def main():
     peaks = decluster_peaks(s, threshold, args.min_separation_hours)
     print(f"{len(peaks)} independent storm peaks above threshold "
           f"(min separation {args.min_separation_hours}h)")
+    peaks.to_csv(out_dir / f"{args.buoy}_{args.var}_declustered_peaks.csv", header=["peak"])
 
     if len(peaks) < 10:
         print("WARNING: fewer than 10 exceedances - GPD fit will be unstable. "

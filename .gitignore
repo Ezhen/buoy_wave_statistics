@@ -1,5 +1,32 @@
+# Generated pipeline output - large, reproducible from scripts + data
 pipeline_out/
+
+# Raw data - large, downloaded via the download_*.py scripts, not source
 data/
+data_multiyear/
+data_multiyear_raw/
+meteo_era5/
+
+# Intermediate download artifacts
+history_file_list.txt
+belgian_19_file_list.txt
+
+# Python
 __pycache__/
 *.pyc
+*.pyo
 .ipynb_checkpoints/
+*.egg-info/
+
+# Environment / credentials - never commit these
+.env
+*.credentials
+.copernicusmarine-credentials
+.cdsapirc
+
+# OS / editor cruft
+.DS_Store
+.vscode/
+.idea/
+*.swp
+0_*.py

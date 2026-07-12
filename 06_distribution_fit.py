@@ -63,6 +63,13 @@ def main():
     print(f"\nBest KS fit (lowest statistic): {best['name']}")
     print("Note: with a few months of data, treat the p-value as a rough guide - "
           "compare the Q-Q plots below visually before committing to one.")
+    print("CAVEAT (two separate reasons, not one): (1) the classical KS test assumes "
+          "iid samples, and Hs is confirmed autocorrelated at every buoy (Ljung-Box) - "
+          "so these p-values were never valid in the textbook sense, independent of "
+          "sample size. (2) at n~2850 the p-value additionally floors near zero "
+          "regardless of fit quality (large-n hypersensitivity). The shape/scale point "
+          "estimates are likely fine; don't cite the p-values as if they mean what a "
+          "textbook KS p-value means.")
 
     # --- Q-Q plots, one panel per candidate ---
     fig, axes = plt.subplots(1, len(CANDIDATES), figsize=(5 * len(CANDIDATES), 5))

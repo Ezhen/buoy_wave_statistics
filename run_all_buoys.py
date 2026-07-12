@@ -1,7 +1,25 @@
 """
-Batch-run the validated pipeline (stages 01 -> 08) across every buoy in
-data/, logging everything to one file. Continues past a failed buoy
-(e.g. a station with no wave sensor) instead of aborting the whole batch.
+Batch-run the validated pipeline across every buoy in data/, gating each
+stage by an explicit, declared requirement instead of the three different
+ad hoc patterns that had accumulated (Stage 10 silently falling back,
+Stage 09 manually excluded from the loop, a script crashing on a missing
+variable). Stage 0 always runs first per buoy - it's what discovers which
+variables and how much record length that buoy actually has, which every
+other stage's eligibility check reads.
+
+Tiers:
+  - Core: no requirements, always runs.
+  - Advanced: requires specific variables (e.g. VTPK for period-based
+    analysis) - most buoys in this network only carry VHM0, so most
+    Advanced-gated stages will be skipped for most buoys. That's expected,
+    not a failure.
+  - Multi-year: requires a minimum record length. Nothing uses this yet
+    (no multi-year data downloaded) - the mechanism is ready for when
+    Mann-Kendall/seasonal-STL/robust-EVA stages get built.
+
+A SKIPPED stage (requirement not met) is logged distinctly from a FAILED
+one (the script actually errored) - skips are expected/normal, failures
+are not, and the batch summary keeps them separate.
 
 Usage:
     python run_all_buoys.py --data-dir data --var VHM0
@@ -13,43 +31,78 @@ to build the cross-buoy comparison table.
 """
 
 import argparse
+import json
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 
+# Each entry: (script, arg_template, requirements)
+# requirements is one of:
+#   {}                                   -> Core, always eligible
+#   {"variables_any": ["VTPK", "VMDR"]}  -> eligible if buoy has at least one
+#   {"variables_all": ["VTPK"]}          -> eligible if buoy has all listed
+#   {"min_record_years": 2.0}            -> eligible once record is long enough
 STAGES = [
-    ("01_load_clean.py", ["--data-dir", "{data_dir}", "--buoy", "{buoy}", "--var", "{var}"]),
-    ("02_eda_diagnostics.py", ["--buoy", "{buoy}", "--var", "{var}"]),
-    ("11b_dependence_structure.py", ["--buoy", "{buoy}", "--var", "{var}"]),
-    ("03_stationarity_tests.py", ["--buoy", "{buoy}", "--var", "{var}"]),
-    ("03b_tidal_notch.py", ["--buoy", "{buoy}", "--var", "{var}", "--harmonics", "2"]),
-    ("04_transform_detrend.py", ["--buoy", "{buoy}", "--var", "{var}", "--diff-order", "1"]),
-    ("05_whiteness_check.py", ["--buoy", "{buoy}", "--var", "{var}"]),
-    ("06_distribution_fit.py", ["--buoy", "{buoy}", "--var", "{var}"]),
-    ("07_arch_lm_test.py", ["--buoy", "{buoy}", "--var", "{var}"]),
-    ("08_extreme_value_analysis.py", ["--buoy", "{buoy}", "--var", "{var}"]),
-    ("10_regime_identification.py", ["--data-dir", "{data_dir}", "--buoy", "{buoy}", "--var", "{var}"]),
+    ("02_eda_diagnostics.py", ["--buoy", "{buoy}", "--var", "{var}"], {}),
+    ("03_stationarity_tests.py", ["--buoy", "{buoy}", "--var", "{var}"], {}),
+    ("03b_tidal_notch.py", ["--buoy", "{buoy}", "--var", "{var}", "--harmonics", "2"], {}),
+    ("11b_dependence_structure.py", ["--buoy", "{buoy}", "--var", "{var}"], {}),
+    ("04_transform_detrend.py", ["--buoy", "{buoy}", "--var", "{var}", "--diff-order", "1"], {}),
+    ("05_whiteness_check.py", ["--buoy", "{buoy}", "--var", "{var}"], {}),
+    ("06_distribution_fit.py", ["--buoy", "{buoy}", "--var", "{var}"], {}),
+    ("07_arch_lm_test.py", ["--buoy", "{buoy}", "--var", "{var}"], {}),
+    ("08_extreme_value_analysis.py", ["--buoy", "{buoy}", "--var", "{var}"], {}),
+    ("12_confidence_intervals.py", ["--buoy", "{buoy}", "--var", "{var}"], {}),
+    # 10's --include-period flag is decided dynamically per buoy below, not
+    # via this static requirements dict, since it's a flag on a Core stage
+    # rather than a separate stage - see build_stage10_args().
+    ("10_regime_identification.py", ["--data-dir", "{data_dir}", "--buoy", "{buoy}", "--var", "{var}"], {}),
+    ("13_stability_analysis.py", ["--buoy", "{buoy}", "--var", "{var}"], {}),
+    ("09_cross_variable_analysis.py", ["--data-dir", "{data_dir}", "--buoy", "{buoy}"],
+     {"variables_any": ["VTPK", "VMDR"]}),
 ]
-# 11b runs right after Stage 0/02 (only needs the cleaned level series) so its
-# persistence-time numbers are on disk before Stage 08 runs, even though
-# Stage 08 doesn't auto-consume them yet - check 11b's output and pass
-# --min-separation-hours to Stage 08 manually if its suggestion differs a lot
-# from Stage 08's default.
-#
-# 09_cross_variable_analysis.py is intentionally NOT in the default loop:
-# only CadzandBoei and Deurlo carry VTPK/VMDR (confirmed via ncdump across all
-# 19 files) - the other 17 always exit with "not enough variables." Run it
-# standalone against those two specifically:
-#   python 09_cross_variable_analysis.py --data-dir data --buoy CadzandBoei
-#   python 09_cross_variable_analysis.py --data-dir data --buoy Deurlo
-# Also dropped --include-period from Stage 10's default args here for the
-# same reason - it silently falls back to Hs-only for 17/19 buoys anyway;
-# run it explicitly with --include-period for CadzandBoei/Deurlo if wanted.
 
 
 def discover_buoys(data_dir: Path):
     return sorted(p.stem for p in data_dir.glob("*.nc"))
+
+
+def stage_eligible(requirements: dict, buoy_info: dict):
+    if not requirements:
+        return True, None
+    available = set(buoy_info.get("available_variables", []))
+    if "variables_any" in requirements:
+        needed = requirements["variables_any"]
+        if not any(v in available for v in needed):
+            return False, f"needs one of {needed}, buoy only has {sorted(available)}"
+    if "variables_all" in requirements:
+        needed = requirements["variables_all"]
+        missing = [v for v in needed if v not in available]
+        if missing:
+            return False, f"missing required variable(s) {missing}"
+    if "min_record_years" in requirements:
+        years = buoy_info.get("record_years", 0.0)
+        if years < requirements["min_record_years"]:
+            return False, f"record is {years:.3f} years, needs >= {requirements['min_record_years']}"
+    return True, None
+
+
+def build_stage10_args(base_args: list, buoy_info: dict):
+    eligible, _ = stage_eligible({"variables_all": ["VTPK"]}, buoy_info)
+    if eligible:
+        return base_args + ["--include-period"]
+    return base_args
+
+
+def run_one(script, args_filled, log):
+    cmd = [sys.executable, script] + args_filled
+    log.write(f"\n$ {' '.join(cmd)}\n")
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    log.write(proc.stdout)
+    if proc.stderr:
+        log.write("\n[stderr]\n" + proc.stderr)
+    return proc
 
 
 def main():
@@ -77,19 +130,44 @@ def main():
         for buoy in buoys:
             log.write(f"\n--- {buoy} ---\n")
             print(f"\n=== {buoy} ===")
+
+            # Stage 0 always runs first, unconditionally - it's what
+            # discovers available_variables/record_years for the gate.
+            stage0_args = ["--data-dir", str(args.data_dir), "--buoy", buoy, "--var", args.var]
+            proc = run_one("01_load_clean.py", stage0_args, log)
+            if proc.returncode != 0:
+                print(f"  FAILED at 01_load_clean.py (see {args.log_file})")
+                log.write(f"\n*** 01_load_clean.py exited with code {proc.returncode} - "
+                          f"stopping remaining stages for {buoy} ***\n")
+                results[buoy] = "01_load_clean.py"
+                continue
+            print("  ok: 01_load_clean.py")
+
+            load_summary_path = (Path("pipeline_out/01_load_clean")
+                                  / f"{buoy}_{args.var}_load_summary.json")
+            buoy_info = {}
+            if load_summary_path.exists():
+                with open(load_summary_path) as f:
+                    buoy_info = json.load(f)
+
             failed_at = None
+            for script, arg_template, requirements in STAGES:
+                if script == "10_regime_identification.py":
+                    filled = build_stage10_args(
+                        [a.format(data_dir=args.data_dir, buoy=buoy, var=args.var)
+                         for a in arg_template],
+                        buoy_info)
+                else:
+                    filled = [a.format(data_dir=args.data_dir, buoy=buoy, var=args.var)
+                              for a in arg_template]
 
-            for script, arg_template in STAGES:
-                filled = [a.format(data_dir=args.data_dir, buoy=buoy, var=args.var)
-                          for a in arg_template]
-                cmd = [sys.executable, script] + filled
-                log.write(f"\n$ {' '.join(cmd)}\n")
+                eligible, reason = stage_eligible(requirements, buoy_info)
+                if not eligible:
+                    print(f"  SKIPPED: {script} ({reason})")
+                    log.write(f"\n$ (skipped) {script} - {reason}\n")
+                    continue
 
-                proc = subprocess.run(cmd, capture_output=True, text=True)
-                log.write(proc.stdout)
-                if proc.stderr:
-                    log.write("\n[stderr]\n" + proc.stderr)
-
+                proc = run_one(script, filled, log)
                 if proc.returncode != 0:
                     print(f"  FAILED at {script} (see {args.log_file})")
                     log.write(f"\n*** {script} exited with code {proc.returncode} - "
@@ -124,8 +202,19 @@ def main():
         print(proc.stdout)
         if proc.returncode != 0:
             print(f"Stage 11 failed (exit {proc.returncode}) - see {args.log_file}")
+
+        print("\nRunning Stage 12b (correlation confidence intervals)...")
+        cmd = [sys.executable, "12b_correlation_confidence.py", "--var", args.var]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        with open(args.log_file, "a") as log:
+            log.write(f"\n--- Stage 12b (network-wide) ---\n$ {' '.join(cmd)}\n{proc.stdout}\n")
+            if proc.stderr:
+                log.write(f"[stderr]\n{proc.stderr}\n")
+        print(proc.stdout)
+        if proc.returncode != 0:
+            print(f"Stage 12b failed (exit {proc.returncode}) - see {args.log_file}")
     else:
-        print(f"\nOnly {n_ok} buoy(s) succeeded - skipping Stage 11 (needs >=3).")
+        print(f"\nOnly {n_ok} buoy(s) succeeded - skipping Stage 11/12b (need >=3).")
 
     print("Run summarize_results.py next to build the cross-buoy comparison table.")
 

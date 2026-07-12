@@ -1,6 +1,7 @@
 """Shared helpers for the Belgian buoy characterization pipeline."""
 
 from pathlib import Path
+import json
 import numpy as np
 import pandas as pd
 import xarray as xr
@@ -80,6 +81,25 @@ def count_raw_duplicate_timestamps(nc_path: Path) -> int:
     with xr.open_dataset(nc_path) as ds:
         time = pd.to_datetime(ds["time"].values)
     return int(pd.Index(time).duplicated().sum())
+
+
+def detect_available_variables(nc_path: Path, candidates=("VHM0", "VTPK", "VTM02", "VMDR")):
+    """Which of the standard wave variables does this buoy's file actually have?
+    Used by the tiering gate to decide which Advanced stages a buoy qualifies for."""
+    with xr.open_dataset(nc_path) as ds:
+        return [v for v in candidates if pick_var(ds, VAR_CANDIDATES.get(v, [v])) is not None]
+
+
+def resolve_block_length(buoy: str, var: str, n_samples: int):
+    """Same resolution Stage 12 uses: prefer Stage 11b's persistence-based
+    block length, fall back to a sqrt(n) heuristic with a loud caveat."""
+    dep_path = Path("pipeline_out/11b_dependence_structure") / f"{buoy}_{var}_dependence_summary.json"
+    if dep_path.exists():
+        with open(dep_path) as f:
+            dep = json.load(f)
+        return dep["suggested_block_length_samples"], "Stage 11b integral timescale", dep.get("hit_max_lag_ceiling", False)
+    block_length = max(1, int(np.sqrt(n_samples)))
+    return block_length, "sqrt(n) fallback - Stage 11b not found, this is a WEAK default", False
 
 
 def default_paths(stage_out: str):
