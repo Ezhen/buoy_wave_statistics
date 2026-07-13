@@ -17,26 +17,7 @@ import pandas as pd
 import xarray as xr
 import matplotlib.pyplot as plt
 
-# Variables of interest, with fallback names (CMEMS in-situ files vary slightly)
-VAR_CANDIDATES = {
-    "VHM0": ["VHM0"],                  # significant wave height
-    "VTPK": ["VTPK"],                  # peak period
-    "VTM02": ["VTM02"],                # mean period
-    "VMDR": ["VMDR"],                  # mean wave direction
-}
-
-
-def pick_var(ds, candidates):
-    for name in candidates:
-        if name in ds.variables:
-            return name
-    return None
-
-
-def get_scalar_latlon(ds):
-    lat = float(np.asarray(ds["latitude"].values).flat[0])
-    lon = float(np.asarray(ds["longitude"].values).flat[0])
-    return lat, lon
+from utils import pick_var, get_scalar_latlon, VAR_CANDIDATES, resolve_coord_name
 
 
 def plot_one_buoy(nc_path: Path, out_dir: Path):
@@ -47,13 +28,15 @@ def plot_one_buoy(nc_path: Path, out_dir: Path):
         except Exception:
             lat, lon = np.nan, np.nan
 
-        # Find a time coordinate
-        time_dim = "time" if "time" in ds.variables else None
-        if time_dim is None:
+        # Find a time coordinate (case-insensitive - NRT and multi-year
+        # downloads use different capitalization for the same field)
+        try:
+            time_name = resolve_coord_name(ds, "TIME")
+        except KeyError:
             print(f"[skip] {name}: no TIME variable found")
             return None
 
-        time = pd.to_datetime(ds["time"].values)
+        time = pd.to_datetime(ds[time_name].values)
 
         present_vars = {k: pick_var(ds, v) for k, v in VAR_CANDIDATES.items()}
         present_vars = {k: v for k, v in present_vars.items() if v is not None}

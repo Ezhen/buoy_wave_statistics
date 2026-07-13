@@ -29,8 +29,41 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from scipy import stats
+from scipy.special import gamma as gamma_fn
+from scipy.optimize import brentq
 
 from utils import default_paths
+
+
+def fast_weibull_moment_fit(x: np.ndarray):
+    """Method-of-moments Weibull fit (loc fixed at 0) via the
+    coefficient-of-variation relation, instead of full MLE.
+
+    Why: scipy.stats.weibull_min.fit() runs a numerical optimizer that
+    evaluates the log-likelihood over the WHOLE array at every iteration
+    - at ~2s per fit on a 500k-sample array, 1000 bootstrap refits costs
+    30-40 minutes, scaling worse on multi-year buoys with 1M+ samples.
+    This needs only mean/std (one O(n) pass, numpy-vectorized) plus a
+    scalar root-find independent of n - milliseconds instead of seconds.
+
+    Simplification stated explicitly: fixes loc=0 (reasonable for a
+    physically-bounded-below quantity like Hs) and doesn't estimate loc
+    per resample the way full MLE would. Fine for building a CI *band*
+    (visual spread), not intended to replace Stage 06's actual point
+    estimate, which still uses full MLE.
+    """
+    x = x[x > 0]
+    mean, std = x.mean(), x.std()
+    if mean <= 0 or std <= 0:
+        raise ValueError("degenerate resample (zero mean or variance)")
+    cv = std / mean
+
+    def cv_gap(k):
+        return np.sqrt(gamma_fn(1 + 2 / k) / gamma_fn(1 + 1 / k) ** 2 - 1) - cv
+
+    shape = brentq(cv_gap, 0.05, 50.0)
+    scale = mean / gamma_fn(1 + 1 / shape)
+    return shape, 0.0, scale
 
 
 def moving_block_bootstrap_resample(x: np.ndarray, block_length: int, rng: np.random.Generator):
@@ -46,7 +79,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--buoy", default="WesthinderBuoy")
     parser.add_argument("--var", default="VHM0")
-    parser.add_argument("--n-bootstrap", default=1000, type=int)
+    parser.add_argument("--n-bootstrap", default=None, type=int,
+                         help="default auto-scales down for large records (bootstrap CI "
+                              "precision barely improves past a few hundred resamples "
+                              "once the underlying sample size itself is huge) - pass "
+                              "explicitly to override")
     parser.add_argument("--quantiles", default="50,90,95",
                          help="comma-separated percentiles of Hs to CI, besides the mean")
     parser.add_argument("--random-state", default=0, type=int)
@@ -58,6 +95,16 @@ def main():
     # ---------- Hs mean/quantile block bootstrap ----------
     clean_path = Path("pipeline_out/01_load_clean") / f"{args.buoy}_{args.var}_clean.csv"
     hs = pd.read_csv(clean_path, index_col=0, parse_dates=True)[args.var].dropna().values
+
+    if args.n_bootstrap is None:
+        if len(hs) >= 500_000:
+            args.n_bootstrap = 200
+        elif len(hs) >= 50_000:
+            args.n_bootstrap = 500
+        else:
+            args.n_bootstrap = 1000
+        print(f"Auto-scaled --n-bootstrap to {args.n_bootstrap} for n={len(hs)} samples "
+              f"(pass --n-bootstrap explicitly to override)")
 
     dep_path = Path("pipeline_out/11b_dependence_structure") / f"{args.buoy}_{args.var}_dependence_summary.json"
     if dep_path.exists():
@@ -93,7 +140,7 @@ def main():
         for q in quantile_list:
             boot_quantiles[q][i] = np.percentile(resample, q)
         try:
-            shape, loc, scale = stats.weibull_min.fit(resample[resample > 0])
+            shape, loc, scale = fast_weibull_moment_fit(resample)
             boot_weibull_curves.append(stats.weibull_min.pdf(x_grid, shape, loc, scale))
             weibull_fit_ok += 1
         except Exception:

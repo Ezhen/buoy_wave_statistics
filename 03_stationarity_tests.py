@@ -15,11 +15,18 @@ import json
 import pandas as pd
 from statsmodels.tsa.stattools import adfuller, kpss
 
-from utils import default_paths
+from utils import default_paths, longest_contiguous_segment
 
 
 def run_tests(series: pd.Series, label: str):
-    s = series.dropna()
+    # ADF/KPSS's own internal lag construction is invalid across a
+    # spliced gap - restrict to the longest contiguous segment rather
+    # than the full gap-spliced record.
+    s, seg_meta = longest_contiguous_segment(series)
+    if seg_meta["n_segments"] > 1:
+        print(f"Record has {seg_meta['n_segments']} contiguous segments - ADF/KPSS "
+              f"run on the longest one only ({seg_meta['pct_of_valid_used']}% of "
+              f"valid samples), not the full gap-spliced record.")
 
     adf_stat, adf_p, adf_lags, adf_nobs, adf_crit, _ = adfuller(s, autolag="AIC")
     kpss_stat, kpss_p, kpss_lags, kpss_crit = kpss(s, regression="c", nlags="auto")
@@ -39,6 +46,8 @@ def run_tests(series: pd.Series, label: str):
         "kpss_pvalue": float(kpss_p),
         "kpss_verdict": kpss_says,
         "tests_agree": bool(agree),
+        "n_gap_segments": seg_meta["n_segments"],
+        "longest_segment_pct_of_valid": seg_meta["pct_of_valid_used"],
     }
     return result
 

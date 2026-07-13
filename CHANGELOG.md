@@ -206,3 +206,141 @@ happened. Dates reflect real batch-run timestamps where available.
 - Consolidated `download_belgian_wave_buoys.py` and `plot_belgian_buoys.py`
   into `wave_pipeline/` (previously sitting outside it, predating the
   folder's creation).
+
+## 2026-07-13 — Multi-year data live, gap-splicing fixes, performance, Mann-Kendall
+
+### Fixed — gap-splicing bugs, found once real multi-year (gappy) data arrived
+All of these share one root cause: a naive `.dropna()` silently
+concatenates the sample before a gap with the sample after it, treating
+unrelated calendar periods as temporally adjacent - fine for point
+statistics (distribution fits, EVA), invalid for anything lag/order-based.
+
+- **`utils.py`**: three new helpers - `longest_contiguous_segment()`,
+  `all_contiguous_segments()` (length-weighted aggregation across every
+  qualifying segment, not just the longest), `segments_by_time_gap()`
+  (for series where gap rows are entirely absent rather than
+  NaN-marked, e.g. Stage 10's regime labels).
+- **`resolve_coord_name()`** added to `utils.py` - case-insensitive
+  lookup for `TIME`/`LATITUDE`/`LONGITUDE`, since the NRT (`subset()`)
+  and multi-year (`get()`) downloads returned different capitalization
+  for the same logical fields. Applied throughout `utils.py`,
+  `download_belgian_wave_buoys_history.py`, `plot_belgian_buoys.py`.
+- **`03b_tidal_notch.py`**: rewritten to fit the harmonic regression on
+  valid data only but evaluate/output on the FULL grid, so gap
+  positions survive as NaN into every downstream stage instead of being
+  silently collapsed - this was the actual source of the erasure
+  everything else inherited.
+- **`02_eda_diagnostics.py`, `03_stationarity_tests.py`,
+  `04_transform_detrend.py`**: now restrict their lag-based computation
+  (ACF/PACF/periodogram, ADF/KPSS, differencing) to the longest
+  contiguous segment instead of the gap-spliced full record.
+- **`11b_dependence_structure.py` (v3, major rewrite)**: v2's "use the
+  longest segment" discarded ~93% of valid data on Westhinder's
+  fragmented 36-year record (longest single segment = 6.9% of valid
+  samples). Now aggregates the integral timescale across every
+  qualifying segment (length-weighted mean) - Westhinder went from
+  using 6.9% of data to 61.4%. `--max-lag` default raised 500->2000
+  (applied per-segment).
+- **`13_stability_analysis.py` `[A]`**: was splitting the post-dropna()
+  COLLAPSED array positionally - a "window" on a fragmented record
+  could be a patchwork of disjoint calendar periods, and printed window
+  start/end dates were actively wrong. Now splits by real calendar
+  time; window sample counts correctly come out unequal reflecting real
+  gap-coverage differences across eras.
+- **`13_stability_analysis.py` `[C]`**: same root issue, different
+  detection method needed (Stage 10's regime labels have gap rows
+  entirely absent, not NaN-marked) - added `segments_by_time_gap()` and
+  bootstraps within each detected segment separately. Cross-validated:
+  detected the same 1905 segments on Westhinder that the NaN-based
+  methods found independently on the raw Hs series.
+- **`13_stability_analysis.py` `[C]` plotting crash**: `ValueError:
+  'yerr' must not contain negative values` - crashed CadzandBoei and
+  Deurlo outright in the first full batch run. Root cause: the
+  bootstrap CI's lower bound can end up ABOVE the point estimate when
+  many segments are shorter than the block length (they resample
+  near-deterministically, biasing the bootstrap distribution - a
+  limitation already flagged as a known caveat, this is its first
+  concrete real-data consequence). Fixed: proper asymmetric error bars
+  from both `ci_low`/`ci_high` (old code only used `ci_low`, applied
+  symmetrically), negative bar lengths clipped to 0 with an explicit
+  warning naming which regime(s) it happened to, instead of crashing.
+  Reproduced the exact crash with a crafted CI before fixing, confirmed
+  fixed after.
+
+### Fixed — batch orchestration
+- **`run_all_buoys.py`**: Stage 08 was never connected to Stage 11b's
+  persistence estimate in the batch path (only in manual single-buoy
+  runs) - every buoy in the first full multi-year batch used the
+  generic 48h declustering default regardless of what 11b had already
+  computed for that specific buoy. Added `build_stage08_args()`, same
+  dynamic-dispatch pattern as Stage 10's `--include-period`. Verified
+  via actual logged command lines that each buoy gets its own window
+  (confirmed different per buoy in a smoke test: 68.9h/66.4h/60.4h).
+  Concrete symptom this fixed: A2Buoy's GPD xi CI was [-0.198, 0.065]
+  (crosses zero) at the wrong window.
+
+### Fixed — performance at multi-year scale
+- **`12_confidence_intervals.py`**: Weibull bootstrap refit used full
+  MLE (`scipy.stats.weibull_min.fit()`) 1000x per buoy - ~2s/fit at
+  500k+ samples meant 30-40+ minutes per buoy, silently (orchestrator
+  buffers stdout until a stage exits), stalling the first full batch
+  run outright. Fixed: `fast_weibull_moment_fit()` - closed-form
+  method-of-moments via the coefficient-of-variation relation, used
+  only inside the bootstrap loop (Stage 06's point estimate still uses
+  full MLE) - validated at 0.02% relative error vs. MLE, ~630x faster.
+  `--n-bootstrap` also now auto-scales down for large records (200 at
+  >=500k samples, 500 at >=50k, 1000 otherwise). A 600k-sample test
+  that would have taken ~33 minutes now runs in ~11 seconds.
+
+### Added
+- **`14_mann_kendall_trend.py`** - Mann-Kendall trend test with Hamed-Rao
+  variance correction for autocorrelation (not the textbook version -
+  Ljung-Box's confirmed serial correlation at every buoy is exactly the
+  condition known to inflate plain Mann-Kendall's false-positive rate).
+  Runs on ANNUAL aggregates (mean and p95 Hs separately - typical
+  climate vs. storm intensity), not raw high-frequency data - both a
+  computational necessity (raw MK is O(n^2), infeasible at 500k+
+  samples) and standard climate-trend-detection practice. Validated
+  three ways before shipping: recovered a known injected +0.02 m/year
+  trend exactly (+0.0200 m/year, p=0.0043); correctly found no trend on
+  an autocorrelated no-trend control; correctly refuses to run below
+  `--min-years` (default 10) rather than producing an unreliable result.
+  Standalone script, not yet wired into `run_all_buoys.py` - only
+  meaningful on the 6 buoys with 30+ year records.
+- **`download_belgian_wave_buoys_multiyear.py`** superseded by
+  `download_belgian_wave_buoys_history.py` after discovering
+  `copernicusmarine.subset()` only ever serves the `latest` (30-day)
+  dataset part for in-situ products, regardless of requested date
+  range - the full archive needs the Files service
+  (`copernicusmarine.get()` with `dataset_part="history"`), a different
+  API entirely. Kept in the repo for the record of what was tried.
+
+### Multi-year data - acquired
+- Full 19-buoy history download via `get()` + `dataset_part="history"`:
+  9778 files across the whole North West Shelf region in the raw
+  listing, grepped down to the 19 Belgian buoys by name
+  (`history/MO/NO_TS_MO_<name>.nc` naming, distinguished from several
+  unrelated Wind/Weather/Tide/MP files at the same sites) - 81.39 MB for
+  all 19 vs. 21.38 GB for the unfiltered whole-region pull.
+- **Real per-buoy coverage, now confirmed**: 6 buoys back to 1990-1997
+  (Westhinder longest, 1990-07-19); 13 buoys from 2009-2021. All extend
+  to 2026-06-30.
+- ERA5 meteo (wind/pressure/temperature, 2010-2026, 3-hourly,
+  monthly-chunked) downloaded in parallel - not yet paired with the
+  buoy data in any analysis.
+
+### Findings - full 19-buoy batch run against real multi-year data
+- Findings reproduce on completely different data than the original
+  2-month NRT window: Zeebrugge's singleton spatial cluster, ~99%
+  effective-N reduction from autocorrelation, correlation-decreasing-
+  with-distance (Spearman r=-0.506) - all close to the NRT-window
+  values.
+- **Westhinder shows two independent signals of possible genuine
+  multi-decade drift** (persistence-timescale spread; Stage 13 mixture
+  artifact with a monotonic +3.2% climb in era means) - **Zeebrugge
+  shows none** (100% window agreement) - the contrast suggests this is
+  a real, site-specific phenomenon, not a pipeline artifact common to
+  all long records. Not yet resolved.
+- A2Buoy's tail is close to exponential (xi ~ 0) even after the Stage
+  08/11b window correction - a genuine finding now, not a methodology
+  artifact, though its updated confidence interval still needs checking.

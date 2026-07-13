@@ -53,10 +53,12 @@ STAGES = [
     ("06_distribution_fit.py", ["--buoy", "{buoy}", "--var", "{var}"], {}),
     ("07_arch_lm_test.py", ["--buoy", "{buoy}", "--var", "{var}"], {}),
     ("08_extreme_value_analysis.py", ["--buoy", "{buoy}", "--var", "{var}"], {}),
+    # 08's --min-separation-hours is decided dynamically per buoy below
+    # from Stage 11b's own persistence estimate, not this static default -
+    # see build_stage08_args().
     ("12_confidence_intervals.py", ["--buoy", "{buoy}", "--var", "{var}"], {}),
-    # 10's --include-period flag is decided dynamically per buoy below, not
-    # via this static requirements dict, since it's a flag on a Core stage
-    # rather than a separate stage - see build_stage10_args().
+    # 10's --include-period flag is likewise decided dynamically - see
+    # build_stage10_args().
     ("10_regime_identification.py", ["--data-dir", "{data_dir}", "--buoy", "{buoy}", "--var", "{var}"], {}),
     ("13_stability_analysis.py", ["--buoy", "{buoy}", "--var", "{var}"], {}),
     ("09_cross_variable_analysis.py", ["--data-dir", "{data_dir}", "--buoy", "{buoy}"],
@@ -93,6 +95,28 @@ def build_stage10_args(base_args: list, buoy_info: dict):
     if eligible:
         return base_args + ["--include-period"]
     return base_args
+
+
+def build_stage08_args(base_args: list, buoy: str, var: str):
+    """Inject --min-separation-hours from Stage 11b's own per-buoy
+    persistence estimate, instead of leaving Stage 08 on its round
+    24-48h default network-wide. Found missing after the first
+    multi-year batch run: 11b was already computing a real
+    per-buoy-justified window (e.g. 184.8h for A2Buoy) but Stage 08
+    never consumed it - every buoy's EVA ran on the same generic
+    default regardless. Concrete symptom that motivated the fix:
+    A2Buoy's GPD xi CI at the default window was [-0.198, 0.065],
+    straddling zero - uninformative about tail boundedness, the same
+    failure mode too-few-peaks caused earlier, just from a
+    too-short-window cause this time."""
+    dep_path = Path("pipeline_out/11b_dependence_structure") / f"{buoy}_{var}_dependence_summary.json"
+    if dep_path.exists():
+        with open(dep_path) as f:
+            dep = json.load(f)
+        decluster_hours = dep.get("suggested_decluster_hours")
+        if decluster_hours:
+            return base_args + ["--min-separation-hours", str(decluster_hours)]
+    return base_args  # no 11b output yet - falls back to Stage 08's own default
 
 
 def run_one(script, args_filled, log):
@@ -157,6 +181,11 @@ def main():
                         [a.format(data_dir=args.data_dir, buoy=buoy, var=args.var)
                          for a in arg_template],
                         buoy_info)
+                elif script == "08_extreme_value_analysis.py":
+                    filled = build_stage08_args(
+                        [a.format(data_dir=args.data_dir, buoy=buoy, var=args.var)
+                         for a in arg_template],
+                        buoy, args.var)
                 else:
                     filled = [a.format(data_dir=args.data_dir, buoy=buoy, var=args.var)
                               for a in arg_template]

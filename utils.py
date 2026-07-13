@@ -21,9 +21,25 @@ def pick_var(ds, candidates):
     return None
 
 
+def resolve_coord_name(ds, logical_name: str) -> str:
+    """Find the actual variable/coord name in ds for a logical name like
+    'TIME', 'LATITUDE', 'LONGITUDE' - case-insensitively. Exists because
+    subset() (NRT) and get() (multi-year history) apparently return
+    different capitalization for the same logical coordinates - rather
+    than rename files by hand every download, resolve it at read time."""
+    candidates = list(ds.variables) + list(ds.coords)
+    for c in candidates:
+        if c.upper() == logical_name.upper():
+            return c
+    raise KeyError(f"No variable matching '{logical_name}' (any case) found. "
+                    f"Available: {list(ds.variables)}")
+
+
 def get_scalar_latlon(ds):
-    lat = float(np.asarray(ds["latitude"].values).flat[0])
-    lon = float(np.asarray(ds["longitude"].values).flat[0])
+    lat_name = resolve_coord_name(ds, "LATITUDE")
+    lon_name = resolve_coord_name(ds, "LONGITUDE")
+    lat = float(np.asarray(ds[lat_name].values).flat[0])
+    lon = float(np.asarray(ds[lon_name].values).flat[0])
     return lat, lon
 
 
@@ -34,7 +50,7 @@ def load_buoy_series(nc_path: Path, varname: str = "VHM0") -> pd.Series:
         if actual_var is None:
             raise ValueError(f"{varname} not found in {nc_path.name}. "
                               f"Available: {list(ds.variables)}")
-        time = pd.to_datetime(ds["time"].values)
+        time = pd.to_datetime(ds[resolve_coord_name(ds, "TIME")].values)
         data = ds[actual_var].values
         if data.ndim > 1:
             data = data.reshape(data.shape[0], -1)[:, 0]
@@ -47,7 +63,7 @@ def load_buoy_dataframe(nc_path: Path, varnames=("VHM0", "VTPK", "VTM02", "VMDR"
     """Load multiple variables from one buoy file, aligned by time. Silently
     skips any variable not present in this particular buoy's file."""
     with xr.open_dataset(nc_path) as ds:
-        time = pd.to_datetime(ds["time"].values)
+        time = pd.to_datetime(ds[resolve_coord_name(ds, "TIME")].values)
         cols = {}
         for v in varnames:
             actual = pick_var(ds, VAR_CANDIDATES.get(v, [v]))
@@ -79,7 +95,7 @@ def haversine_km(lat1, lon1, lat2, lon2):
 def count_raw_duplicate_timestamps(nc_path: Path) -> int:
     """Count duplicate TIME entries before load_buoy_series silently drops them."""
     with xr.open_dataset(nc_path) as ds:
-        time = pd.to_datetime(ds["time"].values)
+        time = pd.to_datetime(ds[resolve_coord_name(ds, "TIME")].values)
     return int(pd.Index(time).duplicated().sum())
 
 
@@ -100,6 +116,91 @@ def resolve_block_length(buoy: str, var: str, n_samples: int):
         return dep["suggested_block_length_samples"], "Stage 11b integral timescale", dep.get("hit_max_lag_ceiling", False)
     block_length = max(1, int(np.sqrt(n_samples)))
     return block_length, "sqrt(n) fallback - Stage 11b not found, this is a WEAK default", False
+
+
+def longest_contiguous_segment(series: pd.Series):
+    """Given a series that may contain NaN gaps (Stage 0 leaves long gaps
+    unfilled rather than bridging them), return the longest contiguous
+    non-NaN run, plus metadata about how much of the record it represents.
+
+    Exists because lag/order-based methods (ACF, differencing, anything
+    that assumes consecutive samples are actually temporally adjacent)
+    are invalid across a spliced gap - a naive .dropna() silently
+    concatenates the pre-gap and post-gap periods as if they were
+    adjacent in time, which corrupts cumulative statistics like ACF far
+    more than it corrupts a single point estimate. Value-only stages
+    (distribution fits, EVA peak-finding) don't need this - order doesn't
+    matter for those.
+    """
+    is_valid = series.notna()
+    if not is_valid.any():
+        empty = series.iloc[0:0]
+        return empty, {"n_segments": 0, "segment_length": 0,
+                        "total_valid_samples": 0, "pct_of_valid_used": 0.0}
+
+    seg_id = (is_valid != is_valid.shift()).cumsum()
+    segments = [group for _, group in series[is_valid].groupby(seg_id[is_valid])]
+
+    longest = max(segments, key=len)
+    total_valid = int(is_valid.sum())
+    meta = {
+        "n_segments": len(segments),
+        "segment_length": len(longest),
+        "total_valid_samples": total_valid,
+        "pct_of_valid_used": round(100 * len(longest) / total_valid, 1),
+        "segment_start": str(longest.index[0]),
+        "segment_end": str(longest.index[-1]),
+    }
+    return longest, meta
+
+
+def all_contiguous_segments(series: pd.Series, min_length: int = 1):
+    """Like longest_contiguous_segment but returns every contiguous
+    non-NaN run at least min_length samples long, sorted longest-first.
+
+    Use when a statistic should aggregate across all usable stretches of
+    a fragmented record rather than discarding everything except the
+    single longest segment - e.g. a 36-year buoy record with hundreds of
+    short outages scattered throughout can have its longest single
+    segment cover under 10% of total valid data, which throws away real
+    information a persistence estimate could otherwise use.
+    """
+    is_valid = series.notna()
+    if not is_valid.any():
+        return []
+    seg_id = (is_valid != is_valid.shift()).cumsum()
+    segments = [group for _, group in series[is_valid].groupby(seg_id[is_valid])]
+    segments = [s for s in segments if len(s) >= min_length]
+    segments.sort(key=len, reverse=True)
+    return segments
+
+
+def segments_by_time_gap(series: pd.Series, dt_hours: float, gap_multiplier: float = 1.5):
+    """Split a time-indexed series into contiguous segments based on
+    actual elapsed time between consecutive index entries - for series
+    where gap positions are entirely ABSENT (missing rows) rather than
+    NaN-marked on a regular grid. Stage 10's regime labels are like this:
+    written only for valid timestamps, so the row-to-row index gap
+    itself is the only signal a real gap happened.
+
+    A break is detected wherever consecutive timestamps are more than
+    gap_multiplier * dt_hours apart (default 1.5x the nominal sampling
+    interval - generous enough to not trip on normal jitter, tight
+    enough to catch a real gap).
+    """
+    if len(series) < 2:
+        return [series] if len(series) else []
+    idx = series.index
+    deltas_hours = (idx[1:] - idx[:-1]).total_seconds() / 3600.0
+    threshold = dt_hours * gap_multiplier
+    break_points = np.where(deltas_hours > threshold)[0] + 1
+    segments = []
+    start = 0
+    for bp in break_points:
+        segments.append(series.iloc[start:bp])
+        start = bp
+    segments.append(series.iloc[start:])
+    return segments
 
 
 def default_paths(stage_out: str):

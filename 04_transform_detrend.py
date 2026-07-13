@@ -21,7 +21,7 @@ import matplotlib.pyplot as plt
 from scipy.stats import boxcox
 from statsmodels.tsa.stattools import adfuller
 
-from utils import default_paths
+from utils import default_paths, longest_contiguous_segment
 
 
 def main():
@@ -36,7 +36,7 @@ def main():
     raw_path = Path("pipeline_out/01_load_clean") / f"{args.buoy}_{args.var}_clean.csv"
 
     if detided_path.exists():
-        s_transformed = pd.read_csv(detided_path, index_col=0, parse_dates=True).iloc[:, 0]
+        s_transformed_full = pd.read_csv(detided_path, index_col=0, parse_dates=True).iloc[:, 0]
         lam = None
         print(f"Using detided series from Stage 2b: {detided_path}")
         s_dropna = pd.read_csv(raw_path, index_col=0, parse_dates=True)[args.var].dropna()  # for plotting only
@@ -48,8 +48,20 @@ def main():
         s_dropna = s.dropna()
         shifted = s_dropna + 1e-6 if (s_dropna <= 0).any() else s_dropna
         transformed_vals, lam = boxcox(shifted.values)
-        s_transformed = pd.Series(transformed_vals, index=s_dropna.index, name=f"{args.var}_boxcox")
+        s_transformed_full = pd.Series(transformed_vals, index=s_dropna.index, name=f"{args.var}_boxcox")
         print(f"Box-Cox lambda = {lam:.4f}")
+
+    # Differencing and the ADF check that follows are lag-based - restrict
+    # to the longest contiguous segment so a splice across a long gap
+    # doesn't get treated as temporally adjacent by adfuller()'s own
+    # internal lag construction (diff() itself is positionally safe once
+    # NaN gaps are preserved - this guards adfuller() specifically).
+    s_transformed, seg_meta = longest_contiguous_segment(s_transformed_full)
+    if seg_meta["n_segments"] > 1:
+        print(f"Record has {seg_meta['n_segments']} contiguous segments - using the "
+              f"longest ({seg_meta['pct_of_valid_used']}% of valid samples, "
+              f"{seg_meta['segment_start']} to {seg_meta['segment_end']}) for "
+              f"differencing/ADF, not the full gap-spliced record.")
 
     # --- Detrend via differencing on the TRANSFORMED (and, if available, detided) series ---
     s_diff = s_transformed.copy()
@@ -72,6 +84,8 @@ def main():
             "diff_order": args.diff_order,
             "adf_stat_after": float(adf_after[0]),
             "adf_pvalue_after": float(adf_after[1]),
+            "n_gap_segments": seg_meta["n_segments"],
+            "longest_segment_pct_of_valid": seg_meta["pct_of_valid_used"],
         }, f, indent=2)
 
     lam_label = f"lambda={lam:.3f}" if lam is not None else "from Stage 2b (detided)"

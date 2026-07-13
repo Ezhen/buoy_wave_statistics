@@ -19,7 +19,7 @@ import matplotlib.pyplot as plt
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 from scipy.signal import periodogram
 
-from utils import default_paths
+from utils import default_paths, longest_contiguous_segment
 
 M2_PERIOD_HOURS = 12.4206  # principal lunar semi-diurnal tide
 
@@ -54,8 +54,13 @@ def main():
     fig.savefig(out_dir / f"{args.buoy}_{args.var}_rolling.png", dpi=150)
     plt.close(fig)
 
-    # --- ACF / PACF ---
-    s_dropna = s.dropna()
+    # --- ACF / PACF / periodogram: lag/frequency-based, restrict to the
+    #     longest contiguous segment so a gap isn't spliced as if adjacent ---
+    s_dropna, seg_meta = longest_contiguous_segment(s)
+    if seg_meta["n_segments"] > 1:
+        print(f"Record has {seg_meta['n_segments']} contiguous segments - ACF/PACF/"
+              f"periodogram computed on the longest one only "
+              f"({seg_meta['pct_of_valid_used']}% of valid samples).")
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
     plot_acf(s_dropna, lags=min(200, len(s_dropna) // 2 - 1), ax=axes[0])
     plot_pacf(s_dropna, lags=min(50, len(s_dropna) // 2 - 1), ax=axes[1], method="ywm")
@@ -100,7 +105,9 @@ def main():
 
     import json
     with open(out_dir / f"{args.buoy}_{args.var}_eda_summary.json", "w") as f:
-        json.dump({"m2_ratio_raw": m2_ratio, "sampling_interval_hours": dt_hours}, f, indent=2)
+        json.dump({"m2_ratio_raw": m2_ratio, "sampling_interval_hours": dt_hours,
+                    "n_gap_segments": seg_meta["n_segments"],
+                    "longest_segment_pct_of_valid": seg_meta["pct_of_valid_used"]}, f, indent=2)
 
     print(f"\nSaved diagnostics to {out_dir}")
 

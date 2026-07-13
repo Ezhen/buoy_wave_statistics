@@ -53,6 +53,8 @@ from pathlib import Path
 import copernicusmarine
 import xarray as xr
 
+from utils import resolve_coord_name
+
 RAW_DIR = Path("data_multiyear_raw")       # everything get() downloads, unfiltered
 FILTERED_DIR = Path("data_multiyear")      # only the Belgian-coast subset, after lat/lon check
 FILE_LIST_PATH = Path("history_file_list.txt")
@@ -128,13 +130,20 @@ def filter_to_belgian_coast():
     for nc_path in nc_files:
         try:
             with xr.open_dataset(nc_path) as ds:
-                lat = float(ds["LATITUDE"].values.flat[0])
-                lon = float(ds["LONGITUDE"].values.flat[0])
+                lat = float(ds[resolve_coord_name(ds, "LATITUDE")].values.flat[0])
+                lon = float(ds[resolve_coord_name(ds, "LONGITUDE")].values.flat[0])
             if (BBOX["minimum_latitude"] <= lat <= BBOX["maximum_latitude"]
                     and BBOX["minimum_longitude"] <= lon <= BBOX["maximum_longitude"]):
-                dest = FILTERED_DIR / nc_path.name
+                # Native history filenames look like NO_TS_MO_WesthinderBuoy.nc -
+                # strip the network/platform-type prefix so the rest of the
+                # pipeline (which expects "<buoy>.nc") can find it without
+                # a manual rename step.
+                clean_name = nc_path.name
+                if "_" in clean_name:
+                    clean_name = clean_name.split("_")[-1]
+                dest = FILTERED_DIR / clean_name
                 shutil.copy2(nc_path, dest)
-                kept.append((nc_path.name, lat, lon))
+                kept.append((clean_name, lat, lon))
         except Exception as e:
             print(f"  Could not read {nc_path.name}: {e}")
 
@@ -155,7 +164,7 @@ def report_coverage():
     for nc_path in nc_files:
         try:
             with xr.open_dataset(nc_path) as ds:
-                time = ds["TIME"].values
+                time = ds[resolve_coord_name(ds, "TIME")].values
                 print(f"  {nc_path.name:45s} {str(time.min())[:10]} -> "
                       f"{str(time.max())[:10]}  (n={len(time)})")
         except Exception as e:

@@ -25,7 +25,7 @@ import matplotlib.pyplot as plt
 from scipy.stats import boxcox
 from scipy.signal import periodogram
 
-from utils import default_paths
+from utils import default_paths, longest_contiguous_segment
 
 M2_PERIOD_HOURS = 12.4206
 
@@ -61,26 +61,55 @@ def main():
     args = parser.parse_args()
 
     in_path = Path("pipeline_out/01_load_clean") / f"{args.buoy}_{args.var}_clean.csv"
-    s = pd.read_csv(in_path, index_col=0, parse_dates=True)[args.var].dropna()
+    s_full = pd.read_csv(in_path, index_col=0, parse_dates=True)[args.var]
+    valid_mask = s_full.notna()
+    s_valid = s_full[valid_mask]
 
-    # --- Variance-stabilize first (same rule as Stage 3/04) ---
-    shifted = s + 1e-6 if (s <= 0).any() else s
+    if valid_mask.sum() < len(s_full):
+        print(f"NOTE: {len(s_full) - int(valid_mask.sum())} gap sample(s) present "
+              f"({100 * (1 - valid_mask.mean()):.1f}% of the grid). Fitting on valid "
+              f"data only, but preserving gap positions as NaN in the output so "
+              f"downstream lag-based stages (differencing, ACF) don't silently splice "
+              f"pre-gap and post-gap periods together as if they were adjacent.")
+
+    # --- Variance-stabilize first (same rule as Stage 3/04), fit on valid data only ---
+    shifted = s_valid + 1e-6 if (s_valid <= 0).any() else s_valid
     boxcox_vals, lam = boxcox(shifted.values)
-    s_bc = pd.Series(boxcox_vals, index=s.index, name=f"{args.var}_boxcox")
     print(f"Box-Cox lambda = {lam:.4f}")
 
-    # --- Harmonic regression fit ---
-    t0 = s_bc.index[0]
-    t_hours = (s_bc.index - t0).total_seconds().values / 3600.0
-    X = build_harmonic_design(t_hours, M2_PERIOD_HOURS, args.harmonics)
-    coefs, *_ = np.linalg.lstsq(X, s_bc.values, rcond=None)
-    tidal_fit = X @ coefs
-    s_detided = pd.Series(s_bc.values - tidal_fit, index=s_bc.index, name=f"{args.var}_detided")
+    # Reindex onto the FULL grid - gap positions become NaN here, not dropped
+    s_bc_valid = pd.Series(boxcox_vals, index=s_valid.index)
+    s_bc_full = s_bc_valid.reindex(s_full.index)
+    s_bc_full.name = f"{args.var}_boxcox"
 
-    # --- Report M2 power before/after ---
-    dt_hours = (s.index[1] - s.index[0]).total_seconds() / 3600.0
-    ratio_before = periodogram_m2_ratio(s_bc.values, dt_hours)
-    ratio_after = periodogram_m2_ratio(s_detided.values, dt_hours)
+    # --- Harmonic regression fit ---
+    # Design matrix built for the FULL grid (purely a function of elapsed
+    # time, so this is fine even at gap positions), but the fit itself
+    # only uses rows where data actually exists.
+    t0 = s_full.index[0]
+    t_hours_full = (s_full.index - t0).total_seconds().values / 3600.0
+    X_full = build_harmonic_design(t_hours_full, M2_PERIOD_HOURS, args.harmonics)
+    X_fit = X_full[valid_mask.values]
+    y_fit = s_bc_valid.values
+    coefs, *_ = np.linalg.lstsq(X_fit, y_fit, rcond=None)
+    tidal_fit_full = X_full @ coefs
+    s_detided = s_bc_full - pd.Series(tidal_fit_full, index=s_full.index)
+    s_detided.name = f"{args.var}_detided"
+
+    # --- Report M2 power before/after, on the longest contiguous segment
+    #     only - a periodogram is also invalid across a spliced gap
+    #     (spurious broadband leakage from the discontinuity) ---
+    seg_bc, seg_meta = longest_contiguous_segment(s_bc_full)
+    seg_detided, _ = longest_contiguous_segment(s_detided)
+    if seg_meta["n_segments"] > 1:
+        print(f"Record has {seg_meta['n_segments']} contiguous segments after gaps; "
+              f"M2 ratio computed on the longest one only "
+              f"({seg_meta['pct_of_valid_used']}% of valid samples, "
+              f"{seg_meta['segment_start']} to {seg_meta['segment_end']}).")
+
+    dt_hours = (s_full.index[1] - s_full.index[0]).total_seconds() / 3600.0
+    ratio_before = periodogram_m2_ratio(seg_bc.values, dt_hours)
+    ratio_after = periodogram_m2_ratio(seg_detided.values, dt_hours)
     print(f"M2 peak/baseline power ratio - before: {ratio_before:.2f}, after: {ratio_after:.2f}")
     if ratio_after > 3:
         print("WARNING: M2 power still elevated after notch - "
@@ -101,15 +130,18 @@ def main():
             "m2_ratio_before": None if np.isnan(ratio_before) else float(ratio_before),
             "m2_ratio_after": None if np.isnan(ratio_after) else float(ratio_after),
             "harmonics": args.harmonics,
+            "n_gap_segments": seg_meta["n_segments"],
+            "longest_segment_pct_of_valid": seg_meta["pct_of_valid_used"],
         }, f, indent=2)
 
     fig, axes = plt.subplots(3, 1, figsize=(12, 8))
-    axes[0].plot(s_bc.index, s_bc.values, lw=0.6)
+    axes[0].plot(s_bc_full.index, s_bc_full.values, lw=0.6)
     axes[0].set_title(f"{args.var} — Box-Cox level (pre-detide)")
-    axes[1].plot(s_bc.index, tidal_fit, lw=0.8, color="darkorange")
+    axes[1].plot(s_full.index, tidal_fit_full, lw=0.8, color="darkorange")
     axes[1].set_title(f"Fitted M2 + harmonics (n_harmonics={args.harmonics})")
     axes[2].plot(s_detided.index, s_detided.values, lw=0.6, color="firebrick")
-    axes[2].set_title(f"{args.var} — detided (ready for Stage 3 differencing)")
+    axes[2].set_title(f"{args.var} — detided (ready for Stage 3 differencing, "
+                       f"gaps preserved as NaN)")
     fig.tight_layout()
     fig.savefig(out_dir / f"{args.buoy}_{args.var}_tidal_notch.png", dpi=150)
     plt.close(fig)

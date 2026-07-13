@@ -33,7 +33,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from scipy import stats
 
-from utils import default_paths, resolve_block_length
+from utils import default_paths, resolve_block_length, segments_by_time_gap
 
 CANDIDATES = {
     "rayleigh": stats.rayleigh,
@@ -77,24 +77,38 @@ def main():
     out_dir = default_paths("13_stability_analysis")
 
     clean_path = Path("pipeline_out/01_load_clean") / f"{args.buoy}_{args.var}_clean.csv"
-    hs = pd.read_csv(clean_path, index_col=0, parse_dates=True)[args.var].dropna()
+    hs_full = pd.read_csv(clean_path, index_col=0, parse_dates=True)[args.var]
+    hs = hs_full.dropna()  # used by [B]/[C] below, which are order-independent and don't need calendar windowing
 
     print(f"--- {args.buoy} / {args.var} stability analysis ---")
 
     # ============ A. Moving-window stability ============
+    # Window by CALENDAR time, not array position. The old version split
+    # the post-dropna() collapsed array into equal-sized positional
+    # chunks - on a fragmented multi-year record (Westhinder: 345+ gap
+    # segments) that meant a "window" could be a patchwork of disjoint
+    # real time periods stitched together, not one contiguous calendar
+    # span, and the printed window start/end dates were actively
+    # misleading (indexing into the collapsed array as if still
+    # chronological). Now windows are real, equal-duration calendar
+    # spans; each one's data is whatever valid samples actually fall in
+    # that span (correctly sparse where gaps exist).
     print(f"\n[A] Moving-window stability ({args.n_windows} windows)")
-    n = len(hs)
-    edges = np.linspace(0, n, args.n_windows + 1).astype(int)
+    t_start, t_end = hs_full.index.min(), hs_full.index.max()
+    edges = pd.date_range(t_start, t_end, periods=args.n_windows + 1)
     window_rows = []
     for i in range(args.n_windows):
-        window = hs.values[edges[i]:edges[i + 1]]
+        mask = (hs_full.index >= edges[i]) & (hs_full.index < edges[i + 1] if i < args.n_windows - 1
+                                                else hs_full.index <= edges[i + 1])
+        window = hs_full[mask].dropna().values
         if len(window) < 30:
-            print(f"  window {i+1}: only {len(window)} samples - skipped, too few to fit")
+            print(f"  window {i+1} ({edges[i].date()} to {edges[i+1].date()}): "
+                  f"only {len(window)} samples - skipped, too few to fit")
             continue
         name, ks = best_fit(window[window > 0])
         window_rows.append({
             "window": i + 1, "n": len(window),
-            "start": str(hs.index[edges[i]]), "end": str(hs.index[edges[i + 1] - 1]),
+            "start": str(edges[i]), "end": str(edges[i + 1]),
             "mean_hs": float(window.mean()), "best_distribution": name, "ks_stat": ks,
         })
         print(f"  window {i+1}: n={len(window):4d}  mean={window.mean():.3f}  "
@@ -177,37 +191,90 @@ def main():
     regime_path = Path("pipeline_out/10_regime_identification") / f"{args.buoy}_{args.var}_regime_labels.csv"
     regime_fraction_ci = None
     if regime_path.exists():
-        regimes = pd.read_csv(regime_path, index_col=0)["regime"].dropna().values.astype(int)
-        n_regimes = regimes.max() + 1
-        block_length, block_source, hit_ceiling = resolve_block_length(args.buoy, args.var, len(regimes))
+        regimes_series = pd.read_csv(regime_path, index_col=0, parse_dates=True)["regime"].dropna()
+        regimes_series = regimes_series.astype(int)
+        n_regimes = regimes_series.max() + 1
+        n_total = len(regimes_series)
+        block_length, block_source, hit_ceiling = resolve_block_length(args.buoy, args.var, n_total)
         print(f"  Block length: {block_length} samples (source: {block_source})")
 
-        boot_fractions = np.zeros((args.n_bootstrap, n_regimes))
-        for i in range(args.n_bootstrap):
-            resample = moving_block_bootstrap_resample(regimes, block_length, rng)
+        # Stage 10's regime labels have gap positions entirely ABSENT
+        # (missing rows), not NaN-marked on a regular grid - a naive
+        # block bootstrap on the whole sequence would silently draw
+        # blocks spanning a real gap seam, treating two unrelated
+        # calendar periods as if temporally adjacent. Segment by actual
+        # elapsed time between rows first, then bootstrap within each
+        # segment only.
+        dt_hours = 0.5
+        load_summary_path = Path("pipeline_out/01_load_clean") / f"{args.buoy}_{args.var}_load_summary.json"
+        if load_summary_path.exists():
+            with open(load_summary_path) as f:
+                dt_hours = json.load(f).get("sampling_interval_hours", 0.5)
+
+        all_segs = segments_by_time_gap(regimes_series, dt_hours)
+        min_len = max(5, block_length // 4)
+        segs_used = [s for s in all_segs if len(s) >= min_len]
+        coverage = sum(len(s) for s in segs_used)
+
+        if len(all_segs) > 1:
+            print(f"  Label sequence fragmented into {len(all_segs)} segments by real time gaps; "
+                  f"using {len(segs_used)} with >= {min_len} samples, covering "
+                  f"{coverage}/{n_total} labels ({100*coverage/n_total:.1f}%) - "
+                  f"bootstrapping within each segment only, never across a gap seam.")
+
+        if not segs_used:
+            print("  No segment long enough to bootstrap - skipping regime fraction CI.")
+        else:
+            boot_fractions = np.zeros((args.n_bootstrap, n_regimes))
+            for i in range(args.n_bootstrap):
+                resample_parts = [moving_block_bootstrap_resample(seg.values, block_length, rng)
+                                   for seg in segs_used]
+                full_resample = np.concatenate(resample_parts)
+                for r in range(n_regimes):
+                    boot_fractions[i, r] = np.mean(full_resample == r)
+
+            point_fractions = np.array([np.mean(regimes_series.values == r) for r in range(n_regimes)])
+            regime_fraction_ci = []
             for r in range(n_regimes):
-                boot_fractions[i, r] = np.mean(resample == r)
+                lo, hi = np.percentile(boot_fractions[:, r], [2.5, 97.5])
+                regime_fraction_ci.append({"regime_id": r, "point_fraction": float(point_fractions[r]),
+                                            "ci_low": float(lo), "ci_high": float(hi)})
+                print(f"  regime {r}: {point_fractions[r]*100:.1f}% of time, "
+                      f"95% CI [{lo*100:.1f}%, {hi*100:.1f}%]")
 
-        point_fractions = np.array([np.mean(regimes == r) for r in range(n_regimes)])
-        regime_fraction_ci = []
-        for r in range(n_regimes):
-            lo, hi = np.percentile(boot_fractions[:, r], [2.5, 97.5])
-            regime_fraction_ci.append({"regime_id": r, "point_fraction": float(point_fractions[r]),
-                                        "ci_low": float(lo), "ci_high": float(hi)})
-            print(f"  regime {r}: {point_fractions[r]*100:.1f}% of time, "
-                  f"95% CI [{lo*100:.1f}%, {hi*100:.1f}%]")
-
-        fig, ax = plt.subplots(figsize=(8, 5))
-        x = np.arange(n_regimes)
-        err = [(point_fractions[r] - regime_fraction_ci[r]["ci_low"]) * 100 for r in range(n_regimes)]
-        ax.bar(x, point_fractions * 100, yerr=err, capsize=5, color="steelblue", alpha=0.7)
-        ax.set_xticks(x)
-        ax.set_xlabel("regime id (0=calmest)")
-        ax.set_ylabel("% of time")
-        ax.set_title(f"{args.buoy} — regime time-fraction with block-bootstrap CI")
-        fig.tight_layout()
-        fig.savefig(out_dir / f"{args.buoy}_{args.var}_regime_fraction_ci.png", dpi=150)
-        plt.close(fig)
+            fig, ax = plt.subplots(figsize=(8, 5))
+            x = np.arange(n_regimes)
+            # Proper asymmetric error bars (lower, upper) - the old version
+            # only used ci_low and applied it symmetrically, silently
+            # ignoring ci_high. Also guard against ci_low > point_fraction,
+            # which can happen when the bootstrap distribution is biased
+            # (e.g. many segments shorter than block_length resample
+            # near-deterministically - see the known limitation noted for
+            # this stage) - matplotlib's yerr can't be negative, so clip
+            # to 0 and flag it rather than crash.
+            lower_err = point_fractions - np.array([c["ci_low"] for c in regime_fraction_ci])
+            upper_err = np.array([c["ci_high"] for c in regime_fraction_ci]) - point_fractions
+            n_clipped = int((lower_err < 0).sum() + (upper_err < 0).sum())
+            if n_clipped > 0:
+                print(f"  NOTE: {n_clipped} regime(s) had a bootstrap CI bound on the "
+                      f"'wrong' side of the point estimate (bootstrap distribution "
+                      f"bias, likely from segments shorter than the block length "
+                      f"resampling near-deterministically) - clipped to 0 for "
+                      f"plotting rather than crashing. Treat that regime's CI with "
+                      f"extra caution.")
+            lower_err = np.clip(lower_err, 0, None) * 100
+            upper_err = np.clip(upper_err, 0, None) * 100
+            ax.bar(x, point_fractions * 100, yerr=[lower_err, upper_err], capsize=5,
+                   color="steelblue", alpha=0.7)
+            ax.set_xticks(x)
+            ax.set_xlabel("regime id (0=calmest)")
+            ax.set_ylabel("% of time")
+            ax.set_title(f"{args.buoy} — regime time-fraction with block-bootstrap CI\n"
+                         f"(segment-aware: {len(segs_used)} segments, "
+                         f"{100*coverage/n_total:.1f}% of labels)")
+            fig.tight_layout()
+            fig.savefig(out_dir / f"{args.buoy}_{args.var}_regime_fraction_ci.png", dpi=150)
+            plt.close(fig)
     else:
         print("  No Stage 10 regime labels found - skipping. Run 10_regime_identification.py first.")
 
