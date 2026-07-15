@@ -46,26 +46,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from statsmodels.tsa.stattools import acf
 
-from utils import default_paths, all_contiguous_segments
-
-
-def integral_timescale(series: np.ndarray, dt_hours: float, max_lag: int, consecutive: int):
-    n = len(series)
-    max_lag = min(max_lag, n // 3) if n >= 9 else max(1, n - 1)
-    rho = acf(series, nlags=max_lag, fft=True)
-    band = 1.96 / np.sqrt(n)
-
-    criterion_lag = None
-    for k in range(1, len(rho) - consecutive + 1):
-        if np.all(np.abs(rho[k:k + consecutive]) < band):
-            criterion_lag = k
-            break
-    hit_ceiling = criterion_lag is None
-    if hit_ceiling:
-        criterion_lag = len(rho) - 1
-
-    tau_hours = dt_hours * (1 + 2 * np.sum(rho[1:criterion_lag]))
-    return tau_hours, criterion_lag, rho, band, hit_ceiling
+from utils import default_paths, all_contiguous_segments, integral_timescale
 
 
 def main():

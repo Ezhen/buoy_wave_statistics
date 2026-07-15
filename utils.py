@@ -203,6 +203,85 @@ def segments_by_time_gap(series: pd.Series, dt_hours: float, gap_multiplier: flo
     return segments
 
 
+def load_era5_for_buoy(lat: float, lon: float, era5_dir: str = "meteo_era5"):
+    """Load ERA5 meteo for the grid cell nearest a buoy's location,
+    concatenated across every monthly file in era5_dir. Returns a
+    DataFrame indexed by time with u10, v10, msl, t2m, sst (raw ERA5
+    names) plus derived wind_speed, wind_dir_from_deg, and
+    air_sea_temp_diff_c.
+
+    Wind direction convention (easy to get backwards, so stated
+    explicitly): meteorological "FROM" convention - the compass bearing
+    the wind is blowing FROM, not the direction the wind vector points
+    TOWARD. u10/v10 give the vector the wind blows TOWARD (eastward/
+    northward components), so:
+        bearing_toward = atan2(u10, v10)   (bearing from north)
+        wind_dir_from = (bearing_toward + 180) mod 360
+    """
+    era5_files = sorted(Path(era5_dir).glob("era5_belgium_*.nc"))
+    if not era5_files:
+        raise FileNotFoundError(f"No era5_belgium_*.nc files found in {era5_dir}")
+
+    frames = []
+    for fp in era5_files:
+        with xr.open_dataset(fp) as ds:
+            time_name = "time" if "time" in ds.variables or "time" in ds.dims else "valid_time"
+            lat_name = resolve_coord_name(ds, "latitude")
+            lon_name = resolve_coord_name(ds, "longitude")
+
+            point = ds.sel({lat_name: lat, lon_name: lon}, method="nearest")
+
+            data = {}
+            for var in ["u10", "v10", "msl", "t2m", "sst"]:
+                if var in point.variables:
+                    data[var] = point[var].values
+
+            time_vals = pd.to_datetime(point[time_name].values)
+            df = pd.DataFrame(data, index=time_vals)
+            frames.append(df)
+
+    era5 = pd.concat(frames).sort_index()
+    era5 = era5[~era5.index.duplicated(keep="first")]
+
+    if "u10" in era5.columns and "v10" in era5.columns:
+        era5["wind_speed"] = np.sqrt(era5["u10"] ** 2 + era5["v10"] ** 2)
+        bearing_toward = np.degrees(np.arctan2(era5["u10"], era5["v10"]))
+        era5["wind_dir_from_deg"] = (bearing_toward + 180) % 360
+
+    if "t2m" in era5.columns and "sst" in era5.columns:
+        era5["air_sea_temp_diff_c"] = era5["t2m"] - era5["sst"]  # Kelvin difference == Celsius difference
+
+    return era5
+
+
+def integral_timescale(series, dt_hours: float, max_lag: int, consecutive: int):
+    """ACF-based integral (decorrelation) timescale, with a significance-
+    band cutoff instead of a single zero-crossing (avoids both spurious
+    early crossings and silently reporting a search-ceiling lower bound
+    as a real measurement). Moved here from 11b_dependence_structure.py
+    so other analyses can reuse it (e.g. checking ERA5 wind's own
+    persistence, not just Hs) without duplicating the logic - Python
+    module names can't start with a digit, so direct import from
+    "11b_dependence_structure" isn't possible."""
+    from statsmodels.tsa.stattools import acf
+    n = len(series)
+    max_lag = min(max_lag, n // 3) if n >= 9 else max(1, n - 1)
+    rho = acf(series, nlags=max_lag, fft=True)
+    band = 1.96 / np.sqrt(n)
+
+    criterion_lag = None
+    for k in range(1, len(rho) - consecutive + 1):
+        if np.all(np.abs(rho[k:k + consecutive]) < band):
+            criterion_lag = k
+            break
+    hit_ceiling = criterion_lag is None
+    if hit_ceiling:
+        criterion_lag = len(rho) - 1
+
+    tau_hours = dt_hours * (1 + 2 * np.sum(rho[1:criterion_lag]))
+    return tau_hours, criterion_lag, rho, band, hit_ceiling
+
+
 def default_paths(stage_out: str):
     """Standard output dir for a pipeline stage."""
     out = Path("pipeline_out") / stage_out

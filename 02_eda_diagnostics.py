@@ -92,9 +92,13 @@ def main():
     plt.close(fig)
 
     # Report power near the M2 peak vs. surrounding baseline
+    DIURNAL_PERIOD_HOURS = 24.0
     near_m2 = np.abs(periods_hours - M2_PERIOD_HOURS) < 0.5
-    baseline = (periods_hours > 6) & (periods_hours < 24) & ~near_m2
+    near_diurnal = np.abs(periods_hours - DIURNAL_PERIOD_HOURS) < 1.0
+    baseline = (periods_hours > 6) & (periods_hours < 30) & ~near_m2 & ~near_diurnal
+
     m2_ratio = None
+    diurnal_ratio = None
     if near_m2.any() and baseline.any():
         m2_power = power[near_m2].max()
         baseline_power = np.median(power[baseline])
@@ -103,9 +107,28 @@ def main():
             print(f"M2 peak power / local baseline power ratio: {m2_ratio:.2f}")
             print("(ratio >> 1 suggests a real tidal signature worth notch-filtering later)")
 
+    # Diurnal (24h) check - added after a real finding: Zeebrugge's ARMA
+    # forecast showed an anomalous local minimum in persistence RMSE right
+    # at 12h (half of 24h), distinct from the M2 half-period, suggesting a
+    # DAILY cycle (wind/tidal-range at this shallow harbor site) separate
+    # from the semi-diurnal M2 tide Stage 03b already targets. Worth
+    # checking on every buoy going forward, not just Zeebrugge - the
+    # existing notch only ever targeted M2, so a real 24h signal would
+    # currently pass through completely untouched.
+    if near_diurnal.any() and baseline.any():
+        diurnal_power = power[near_diurnal].max()
+        baseline_power = np.median(power[baseline])
+        diurnal_ratio = float(diurnal_power / baseline_power) if baseline_power > 0 else None
+        if diurnal_ratio is not None:
+            print(f"Diurnal (24h) peak power / local baseline power ratio: {diurnal_ratio:.2f}")
+            if diurnal_ratio > 3:
+                print("(ratio > 3 suggests a real daily cycle, separate from M2 - "
+                      "Stage 03b's notch does NOT currently target this)")
+
     import json
     with open(out_dir / f"{args.buoy}_{args.var}_eda_summary.json", "w") as f:
-        json.dump({"m2_ratio_raw": m2_ratio, "sampling_interval_hours": dt_hours,
+        json.dump({"m2_ratio_raw": m2_ratio, "diurnal_ratio_raw": diurnal_ratio,
+                    "sampling_interval_hours": dt_hours,
                     "n_gap_segments": seg_meta["n_segments"],
                     "longest_segment_pct_of_valid": seg_meta["pct_of_valid_used"]}, f, indent=2)
 

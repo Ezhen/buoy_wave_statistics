@@ -230,6 +230,13 @@ that would have taken ~33 minutes now runs in ~11 seconds.
 | 9 | `11_spatial_statistics.py` | Network-wide correlation, correlation-vs-distance, clustering |
 | — | `12b_correlation_confidence.py` | Fisher z CI on Stage 11's correlations, autocorrelation-corrected |
 | — | `14_mann_kendall_trend.py` | Hamed-Rao-corrected trend test on annual mean/p95 Hs — standalone, not in `run_all_buoys.py`; only meaningful on 30+ year records (6 of 19 buoys) |
+| — | `15_seasonal_decomposition.py` | STL seasonal decomposition on monthly mean/p95 Hs — same 6-buoy scope as Stage 14 |
+| — | `16_wind_wave_coupling.py` | ERA5 wind/MSLP cross-correlation with Hs, diurnal + persistence-timescale checks on wind itself, directional alignment (VMDR buoys only) |
+| — | `17_forecast_baseline.py` | Persistence forecast baseline + shared rolling-origin backtest harness (`forecast_utils.py`) |
+| — | `18_forecast_arma.py` | ARMA point forecast, backtested against local persistence |
+| — | `19_forecast_arma_garch.py` | ARMA-GARCH: point forecast + calibrated prediction interval |
+| — | `20_forecast_armax.py` | ARMAX: ARMA + lagged ERA5 wind speed as exogenous regressor |
+| — | `21_forecast_exceedance.py` | Probabilistic "will Hs exceed threshold X in the next Nh" classification, optional wind feature |
 
 **Why 06/08/12 use the raw level series, not the residual**:
 Rayleigh/Weibull/GPD describe Hs itself (positive, right-skewed); a
@@ -292,28 +299,100 @@ effective-N correction both come from Stage 11b.
   pipeline artifact common to all long records. Not yet resolved — see
   `PLAN_next_session.md`.
 
-### Zeebrugge — flagged, not resolved
+### Zeebrugge — five independent lines of evidence it's structurally distinct
 
-Zeebrugge's tidal notch never fully cleans (residual M2 ratio ~36 even
-at 3 harmonics — barely different from 2 harmonics), and three
-independent analyses now agree it's dynamically distinct from the rest
-of the network: worst tidal contamination, its own spatial cluster, and
-an unstable distribution-fit verdict across sub-windows (Stage 13).
-Working theory: the notch's fixed-M2-exact-frequency assumption doesn't
-hold at this shallow/harbor site (possible S2 constituent or
-shoaling-shifted frequency). Not chased further — flagged as a scoped
-future fix (fit the tidal frequency rather than assume it) rather than
-something to solve by increasing `--harmonics` indefinitely.
+Zeebrugge's tidal notch never fully cleans regardless of approach tried
+(2 vs. 3 harmonics; fitting the actual dominant frequency instead of
+assuming M2). **The frequency hypothesis was tested directly and
+rejected**: fitted period came back 12.4163h — essentially exact M2
+(delta -0.0043h), nowhere near S2. Even with the *correct* frequency,
+the notch made things measurably *worse*, ruling out "wrong fundamental
+frequency" as the explanation. Two untested remaining hypotheses
+(compound/shallow-water tide like MS4; time-varying tidal parameters
+over the 14-year record) — not pursued further, this isn't a
+parameter-tuning problem.
+
+A joint M2+diurnal harmonic notch was also tried and **not adopted** —
+partial, inconsistent real-data improvement (5-80% across 3 test
+buoys, never below the "clean" threshold), doesn't justify the
+downstream re-validation cost.
+
+**Five independent analyses now agree Zeebrugge is dynamically
+distinct**, not just noisier: worst tidal contamination; its own
+singleton spatial cluster (reproduced on both NRT and multi-year data);
+unstable distribution-fit verdict across sub-windows; and — new —
+**wind-wave coupling collapses** (R²=0.093 vs. network median 0.565,
+and the MSLP leading-indicator mechanism inverts sign entirely, lagging
+instead of leading). Plausible mechanism: as the most sheltered,
+harbor-interior site in the network, local wave conditions are likely
+dominated by harbor geometry/vessel wake rather than direct open-water
+wind forcing — a genuinely different causal pathway. Treated as a
+structurally different site (harbor case study) rather than a
+characterization target to keep forcing into the same framework as the
+other 18 buoys.
+
+### Wind-wave coupling (ERA5, Stages 16/20/21)
+
+Strong, consistent signature across 18 of 19 buoys: wind leads Hs by
+0-3h, R² up to 0.71-0.77 (Westhinder), MSLP consistently leads with the
+physically correct pressure-drop-precedes-Hs-rise sign. A genuine ~24h
+diurnal cycle exists in Hs at every buoy tested (85-289x baseline
+power) — confirmed to be substantially wind-driven (land-sea breeze),
+not primarily an unmodeled tidal constituent, by checking ERA5 wind's
+own diurnal signature independently.
+
+Wind adds real forecasting value beyond what Hs's own autoregressive
+structure already captures: ARMAX beats plain ARMA at every horizon
+tested on both Westhinder and A2Buoy, and the benefit does not fade
+with horizon — traced to the fact that Hs's own short-term features
+become progressively less informative as forecast horizon extends,
+while wind (reflecting broader synoptic state) retains more relative
+relevance. Same pattern holds independently for exceedance
+classification (Stage 21).
+
+## Forecasting (Stages 17-21)
+
+Built after the characterization pipeline's uncertainty machinery
+(Stage 12/13) was trusted — deliberately, not started earlier, since
+validating a forecast against point estimates of unknown uncertainty
+would have been premature. Six stages, each validated on synthetic data
+with a known answer before trusting it on real data (see
+`CHANGELOG.md` for the specific bugs each one caught along the way —
+several were real, not superficial):
+
+- **Persistence baseline + shared backtest harness** (`forecast_utils.py`,
+  `17_forecast_baseline.py`) — every later model reuses this harness.
+- **ARMA** (`18_forecast_arma.py`) — beats persistence at every horizon
+  tested on Westhinder (skill 0.10-0.30, growing with horizon).
+- **ARMA-GARCH** (`19_forecast_arma_garch.py`) — adds a calibrated
+  prediction interval (95% coverage, verified on real data), not just a
+  point forecast. Westhinder's volatility is near-IGARCH
+  (alpha+beta≈1) — variance shocks barely decay within any
+  practically forecastable horizon.
+- **ARMAX** (`20_forecast_armax.py`) — adds lagged ERA5 wind as an
+  exogenous regressor. Handles the honest-forecasting constraint
+  explicitly: real future wind isn't known any more than real future
+  Hs is, so exog is only genuinely known within the wind-Hs lag window
+  and persisted (not fabricated) beyond it.
+- **Exceedance forecasting** (`21_forecast_exceedance.py`) — reframes
+  as "will Hs exceed threshold X in the next N hours" (probabilistic
+  classification, Brier score + ROC-AUC), arguably more operationally
+  relevant than point forecasts. Optional wind feature improves skill
+  consistently across both buoys tested, and the benefit does not fade
+  with horizon.
+
+All of this is standalone (buoy-by-buoy, run manually), not wired into
+`run_all_buoys.py` — same pattern as Stages 14-16.
 
 ## Where this stops
 
-This pipeline characterizes the **regime** — it does not forecast. An
-AR/ARMA(-GARCH) forecasting stage was discussed and deliberately not
-started, on the reasoning that validating a forecast against point
-estimates whose own uncertainty was unknown would have been premature —
-Stage 12/13 (uncertainty and stability) were built first for exactly
-this reason. Stage 14 (Mann-Kendall trend, Hamed-Rao corrected) is
-built and validated on synthetic data but not yet run against the real
-6 long-record buoys. See `PLAN_next_session.md` for the full priority
-queue, including forecasting, seasonal decomposition (needs the
-multi-year data now in hand), and the Zeebrugge tidal-frequency fix.
+Point/probabilistic forecasting is now built (see above), but this is
+still fundamentally a **characterization + forecasting toolkit**, not
+an operational system — no automated retraining, no real-time data
+feed, no alerting layer. The parked industrial-monitoring ideas
+(CUSUM/EWMA) from an earlier external review would sit on top of Stage
+21's exceedance probabilities if built. See `PLAN_next_session.md` for
+the current priority queue and every open question that's still
+genuinely unresolved (Zeebrugge's tidal-frequency mystery, the
+diurnal-signal investigation, per-buoy wind-lag calibration beyond
+Westhinder/A2Buoy).

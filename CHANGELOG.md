@@ -344,3 +344,125 @@ statistics (distribution fits, EVA), invalid for anything lag/order-based.
 - A2Buoy's tail is close to exponential (xi ~ 0) even after the Stage
   08/11b window correction - a genuine finding now, not a methodology
   artifact, though its updated confidence interval still needs checking.
+
+## 2026-07-14 — Gap-splicing generalized, Priority 4 closed, wind coupling, full forecasting pipeline (Stages 14-21)
+
+### Fixed — gap-splicing, extended beyond the lag-based stages
+- **`13_stability_analysis.py` `[C]` crash**: `ValueError: 'yerr' must
+  not contain negative values` - crashed CadzandBoei/Deurlo outright.
+  Root cause: bootstrap CI's lower bound can land above the point
+  estimate when many segments are shorter than the block length
+  (near-deterministic resampling biases the distribution). Fixed with
+  proper asymmetric error bars (old code only used `ci_low`, applied
+  symmetrically) and negative-width clipping with an explicit warning.
+  Reproduced the exact crash with a crafted CI before fixing.
+- **`utils.segments_by_time_gap()`** added - for series where gap
+  positions are entirely ABSENT (missing rows) rather than NaN-marked,
+  e.g. Stage 10's regime labels. Cross-validated: found the same 1905
+  segments on Westhinder that NaN-based detection found independently
+  on the raw Hs series.
+- **`utils.integral_timescale()`** and **`select_order()`** both moved
+  out of their original stage scripts (`11b_dependence_structure.py`,
+  `18_forecast_arma.py`) into shared modules (`utils.py`,
+  `forecast_utils.py`) so later stages could reuse them without
+  duplicating logic - Python module names can't start with a digit, so
+  direct import from a numbered stage file isn't possible. Verified no
+  regression in both source stages after each move.
+
+### Priority 4 (Zeebrugge tidal-frequency) — CLOSED
+- `03b_tidal_notch.py` extended with `--fit-frequency`: finds the
+  actual dominant period near M2 instead of assuming it exactly, via a
+  periodogram search on the longest contiguous segment. Validated on
+  synthetic data with an injected S2 (not M2) signal - fixed-M2 made
+  things worse (669162->669434), frequency-fitting recovered the true
+  period exactly and cleaned the signal ~59,000x.
+- **Real result: hypothesis rejected.** Fitted period on real Zeebrugge
+  data: 12.4163h - essentially exact M2 (delta -0.0043h), nowhere near
+  S2. Even with the correct frequency, the notch measurably worsened
+  (1142->1592). Rules out "wrong fundamental frequency" as the
+  explanation. Reverted to the harmonics=2 non-fitted default.
+- Joint M2+diurnal notch also tried (`--diurnal-harmonics N`) after a
+  separate diurnal-signal investigation (below) - real but partial,
+  inconsistent improvement on 3 test buoys (5-80% reduction, never
+  below the clean threshold) - not adopted, flag left in the codebase
+  as validated-but-unused infrastructure.
+
+### Priority 5 (wind-wave coupling) — CLOSED, full network run
+- `utils.load_era5_for_buoy()` added - nearest-grid-cell extraction,
+  concatenated across monthly ERA5 files, derived wind_speed and
+  wind_dir_from_deg (meteorological convention, hand-verified against
+  all 4 cardinal directions before trusting it).
+- `16_wind_wave_coupling.py` added - wind/MSLP CCF with Hs, R² summary,
+  directional alignment by regime (VMDR buoys only). **Caught and fixed
+  a real CCF lag-sign bug before it ran on real data** - empirically
+  verified (known-lag synthetic test) that positive lag means x leads
+  y, opposite of the first draft's assumption.
+- **Full 19-buoy run**: consistent signature at 18/19 buoys (wind leads
+  0-3h, R² 0.41-0.84, MSLP correctly leads). Zeebrugge collapses
+  (R²=0.093, MSLP mechanism inverts) - see Zeebrugge section above.
+- **Diurnal signal investigation**: Stage 02 extended with a general
+  24h-band power-ratio check (validated on synthetic injected-signal
+  data) - found a real ~24h Hs signal at every buoy tested (85-289x
+  baseline), not Zeebrugge-specific. Checked whether ERA5 wind itself
+  shows the same cycle (land-sea-breeze hypothesis) - confirmed at all
+  4 buoys tested (75-1986x). Building the wind persistence-timescale
+  check to explain a related ARMAX finding surfaced two more real bugs
+  in sequence: raw wind gave an implausible 343h timescale (seasonal
+  contamination, same category of mistake 11b itself originally made);
+  first fix (rolling-mean deseasonalizing) gave a mathematically
+  impossible NEGATIVE timescale (spurious autocorrelation artifact of
+  rolling-mean subtraction); second fix (harmonic regression at the
+  annual period, reusing Stage 03b's already-trusted method) gave
+  57.3h - validated on a synthetic AR(1)+seasonal test with a known
+  answer (57.0h true) before trusting the real result.
+
+### Priority 6 (forecasting) — Stages A-F all built, tested, closed
+- **`forecast_utils.py`** (Stage B, shared harness) +
+  **`17_forecast_baseline.py`** (Stage A, persistence). Caught a real
+  off-by-one (origin semantics) via an analytical ground-truth test on
+  a deterministic ramp - fixed before it ran on real data. Separately
+  caught and fixed a real O(n^2) performance bug on the actual
+  Westhinder run (5+ minutes, still not finished) - traced to passing
+  the full ever-growing history to a model that only needed a small
+  bounded window; fixed via a `history_window` parameter, verified
+  17s at 630k samples after the fix (down from 5+ min).
+- **`18_forecast_arma.py`** (Stage C) - beats persistence at every
+  horizon on Westhinder (0.10-0.30 skill, growing with horizon).
+  Caught a real design bug: hardcoded `d=1` (copied from Stage 04,
+  tuned for a different series) gave NEGATIVE skill at every horizon
+  beyond 1h on A2Buoy; fixed by searching `d` instead of assuming it -
+  default changed to `d=0` only after confirming the fix reversed
+  every negative result to positive.
+- **`19_forecast_arma_garch.py`** (Stage D) - point forecast + 95% PI.
+  Real Westhinder fit landed almost exactly at the IGARCH boundary
+  (alpha+beta=1.0000000000273) - required two rounds of fixing the
+  multi-step variance formula for this regime (first attempt used a
+  flat forecast, which was itself WRONG and caused a real regression,
+  caught by re-running on real data; corrected to the proper linear-
+  growth IGARCH limit, verified via exact match against direct
+  numerical iteration of the true recursion, not just re-derived by
+  eye a second time).
+- **`20_forecast_armax.py`** (Stage E) - ARMA + lagged wind exog.
+  Explicit honest-forecasting design: exog only genuinely known within
+  the wind-Hs lag window, persisted (not fabricated) beyond it -
+  validated on synthetic data showing the predicted signature (skill
+  peaks at the lag boundary, reverses negative beyond it). Real
+  Westhinder result diverged informatively: skill stayed positive
+  through 24h rather than reversing, explained (and confirmed) by
+  wind's own 57.3h persistence timescale extending well beyond the
+  tested horizon range.
+- **`21_forecast_exceedance.py`** (Stage F) - probabilistic "will Hs
+  exceed threshold X in next Nh" classification (Brier score, ROC-AUC),
+  optional wind feature. Validated on two synthetic scenarios (Hs-
+  driven and wind-driven exceedance) before trusting real results.
+  Real result on Westhinder: skill +0.42 to +0.68, largely reflecting
+  the buoy's already-known extreme persistence recast into a
+  classification frame. Wind-augmentation tested on 2 real buoys
+  (Westhinder, A2Buoy) - helps consistently at every threshold/horizon
+  (12/12 positive deltas), benefit does not fade with horizon at either
+  buoy - though the specific mechanistic explanation proposed for
+  Westhinder's flat pattern didn't survive testing against A2Buoy
+  (which showed a GROWING delta, opposite of the prediction) - revised
+  to a more general, better-supported explanation involving the
+  relative information decay of Hs's own autoregressive features vs.
+  wind's broader synoptic relevance.
