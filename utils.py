@@ -282,6 +282,74 @@ def integral_timescale(series, dt_hours: float, max_lag: int, consecutive: int):
     return tau_hours, criterion_lag, rho, band, hit_ceiling
 
 
+def get_provenance(input_path=None, random_seed=None):
+    """Provenance metadata to merge into a stage's own summary JSON - not
+    a new file per stage. Added after a real, repeated pain point this
+    session: three separate wrong-API-guess corrections against
+    copernicusmarine, each costing real debugging time to pin down
+    "which version's signature am I actually looking at". Attaching this
+    to every run makes that question answerable in seconds instead of
+    requiring a fresh pip show / git log investigation each time.
+
+    input_path fingerprint uses mtime+size, not a full content hash -
+    deliberate tradeoff: hashing a 500k+ row CSV fully on every stage
+    run would add real time for a use case ("did this input change
+    since last run") that mtime+size already answers correctly for
+    almost every real scenario (a file that's been re-downloaded or
+    re-generated will have a different mtime or size). Full-content
+    hashing would only matter if a file were rewritten with identical
+    size and a spoofed mtime, which isn't a real risk here - stated
+    explicitly rather than silently picking the weaker option.
+    """
+    import subprocess
+    import sys
+    import platform
+    from datetime import datetime, timezone
+    import importlib.metadata as _md
+
+    prov = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "python_version": platform.python_version(),
+        "random_seed": random_seed,
+    }
+
+    try:
+        result = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True,
+                                 text=True, timeout=5)
+        prov["git_commit_hash"] = result.stdout.strip() if result.returncode == 0 else None
+    except Exception:
+        prov["git_commit_hash"] = None
+
+    try:
+        result = subprocess.run(["git", "status", "--porcelain"], capture_output=True,
+                                 text=True, timeout=5)
+        prov["git_working_tree_dirty"] = bool(result.stdout.strip()) if result.returncode == 0 else None
+    except Exception:
+        prov["git_working_tree_dirty"] = None
+
+    pkg_versions = {}
+    for pkg in ["numpy", "pandas", "scipy", "statsmodels", "xarray", "matplotlib",
+                "arch", "scikit-learn", "copernicusmarine", "cdsapi"]:
+        try:
+            pkg_versions[pkg] = _md.version(pkg)
+        except _md.PackageNotFoundError:
+            pkg_versions[pkg] = None
+    prov["package_versions"] = pkg_versions
+
+    if input_path is not None:
+        p = Path(input_path)
+        if p.exists():
+            stat = p.stat()
+            prov["input_file"] = {
+                "path": str(p), "size_bytes": stat.st_size,
+                "mtime_utc": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+            }
+        else:
+            prov["input_file"] = {"path": str(p), "error": "file not found"}
+
+    return prov
+
+
 def default_paths(stage_out: str):
     """Standard output dir for a pipeline stage."""
     out = Path("pipeline_out") / stage_out

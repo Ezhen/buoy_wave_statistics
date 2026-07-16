@@ -263,13 +263,37 @@ effective-N correction both come from Stage 11b.
 - **Weibull wins 17/19** buoys for Hs distribution; log-normal the other 2.
 - **ARCH effects significant at all 19 buoys** — volatility clustering
   is universal.
-- **EVA reliability required lowering the threshold** to the 85th
-  percentile / 24h separation (from the 95th-percentile default) to get
-  >=10 storm peaks at every buoy; all GPD shape parameters came out
-  negative (bounded upper tail) once reliable.
+- **EVA declustering window is per-buoy, not a fixed default** — each
+  buoy's Stage 08 run uses its own Stage 11b persistence-based window
+  (typically 100-270h on the real multi-year data), not a generic
+  round-number default. This was a real fix made after discovering the
+  first full multi-year batch had used the same 48h window network-wide
+  regardless of what 11b had already computed per buoy — see
+  `CHANGELOG.md`.
+- **GPD shape parameters, corrected network run: -0.544 to +0.327** —
+  tightened dramatically after the declustering fix above (previously a
+  much wider, partly-artifactual range under the old fixed-window
+  approach). The reliable core of the network (many storm peaks, narrow
+  CIs — Trapegeer, ScheurWielingen, AkkaertSouthwest, Wandelaar)
+  clusters tightly around **-0.27 to -0.32** (bounded upper tail),
+  roughly 2x more negative than a published shallow-water North Sea
+  reference (Caires 2011, xi≈-0.12 to -0.13) — plausibly because BCZ
+  buoys are shallower/more depth-limited than that 19m reference site,
+  not a methodology gap.
+  **Blankenberge is a real outlier** — the only positive xi in the
+  network (+0.327, CI crosses zero), with both the fewest storm peaks
+  (43) and shortest record (2.77 years) of any buoy. Positive xi
+  implies an unbounded tail, physically implausible for depth-limited
+  shallow-sea waves — near-certainly a small-sample artifact, not a
+  genuine finding. Don't trust this buoy's xi at face value.
 - **GPD xi confidence intervals vary hugely by peak count** — some
-  cross zero (uninformative about tail boundedness), others don't. Don't
-  compare xi point estimates across buoys without checking their CIs.
+  cross zero (uninformative about tail boundedness, e.g. Blankenberge
+  above), others are wide-but-entirely-negative (imprecise but still
+  confidently bounded, e.g. Raversijde1Buoy: CI [-0.929, -0.271] from
+  only 67 peaks — different from "unreliable," worth distinguishing).
+  Don't compare xi point estimates across buoys without checking their
+  CIs. `summarize_results.py` now includes this cross-check
+  automatically (sorted by |xi|, flags wide/zero-crossing CIs).
 - **Spatial correlation decreases with distance** (Spearman r ≈ -0.47);
   4-cluster structure is geographically sensible, with **Zeebrugge as a
   singleton cluster** — independently corroborated by its extreme M2
@@ -330,6 +354,20 @@ wind forcing — a genuinely different causal pathway. Treated as a
 structurally different site (harbor case study) rather than a
 characterization target to keep forcing into the same framework as the
 other 18 buoys.
+
+**A sixth check was tried and came back ambiguous, not confirmatory —
+worth recording honestly rather than omitting.** Statistical-fingerprint
+clustering (distribution/tail/persistence/regime similarity, a
+different lens than the correlation-based spatial clustering above)
+initially showed Zeebrugge as its own cluster too — but this dissolved
+once record-length/missingness metadata (14.3yr, 20.8% missing — both
+real outliers among the 19 buoys) was excluded from the feature set.
+Zeebrugge's fingerprint-based distinctiveness looks like it was
+substantially driven by those metadata differences, not by its core
+behavioral properties — this specific piece of evidence is downgraded
+accordingly. The other five lines above are unaffected (none depend on
+this feature set), so the overall case for Zeebrugge being distinct
+doesn't weaken, but it rests on five confirmed lines, not six.
 
 ### Wind-wave coupling (ERA5, Stages 16/20/21)
 

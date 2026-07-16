@@ -95,6 +95,27 @@ def summarize_one(buoy: str, var: str) -> dict:
     row["gpd_shape_xi"] = eva.get("gpd_shape")
     row["eva_fit_reliable"] = eva.get("fit_reliable")
 
+    # Added for the GPD xi external-literature cross-check (README/PLAN):
+    # is the network's most extreme xi values (down to -1.31) coming from
+    # buoys with reliable (narrow-CI, many-peak) estimates, or from the
+    # same small-peak-count buoys already known to have unreliable CIs?
+    conf = safe_load_json(STAGE_DIR / "12_confidence_intervals" / f"{buoy}_{var}_confidence_summary.json")
+    xi_ci = conf.get("gpd_xi_ci")
+    if xi_ci:
+        row["gpd_xi_ci_low"] = xi_ci.get("ci_low")
+        row["gpd_xi_ci_high"] = xi_ci.get("ci_high")
+        if xi_ci.get("ci_low") is not None and xi_ci.get("ci_high") is not None:
+            row["gpd_xi_ci_width"] = xi_ci["ci_high"] - xi_ci["ci_low"]
+            row["gpd_xi_ci_crosses_zero"] = bool(xi_ci["ci_low"] < 0 < xi_ci["ci_high"])
+        else:
+            row["gpd_xi_ci_width"] = None
+            row["gpd_xi_ci_crosses_zero"] = None
+    else:
+        row["gpd_xi_ci_low"] = None
+        row["gpd_xi_ci_high"] = None
+        row["gpd_xi_ci_width"] = None
+        row["gpd_xi_ci_crosses_zero"] = None
+
     return row
 
 
@@ -139,6 +160,34 @@ def main():
                                  ["buoy", "sampling_interval_hours"]]
             if len(mismatched):
                 print(mismatched.to_string(index=False))
+
+    # GPD xi external-literature cross-check: this network's range (-1.31
+    # to -0.04) extends far more negative than a published shallow-water
+    # North Sea reference (Caires 2011, xi=-0.12 to -0.13). Is the most
+    # extreme end genuine site-specific depth-limiting, or a small-peak-
+    # count reliability artifact? Sorted by |xi| so the most extreme
+    # values sit next to the exact numbers needed to judge that.
+    if "gpd_shape_xi" in df.columns and df["gpd_shape_xi"].notna().any():
+        xi_check = df[["buoy", "gpd_shape_xi", "n_storm_peaks", "gpd_xi_ci_width",
+                        "gpd_xi_ci_crosses_zero", "eva_fit_reliable"]].dropna(subset=["gpd_shape_xi"])
+        xi_check = xi_check.reindex(xi_check["gpd_shape_xi"].abs().sort_values(ascending=False).index)
+        print(f"\n{'=' * 70}\nGPD xi cross-check: most extreme first (vs. published shallow-water "
+              f"North Sea reference of xi~-0.12 to -0.13, Caires 2011)\n{'=' * 70}")
+        print(xi_check.to_string(index=False))
+        extreme = xi_check[xi_check["gpd_shape_xi"] < -0.5]
+        if len(extreme):
+            wide_ci = extreme[(extreme["gpd_xi_ci_width"] > 0.5) | (extreme["gpd_xi_ci_crosses_zero"] == True)]  # noqa: E712
+            if len(wide_ci):
+                print(f"\nNOTE: {len(wide_ci)} of the most extreme xi value(s) also have a wide "
+                      f"or zero-crossing CI ({', '.join(wide_ci['buoy'].tolist())}) - treat these "
+                      f"specific extreme values as likely small-sample artifacts, not established "
+                      f"physical findings, until checked further.")
+            narrow_ci = extreme[~extreme.index.isin(wide_ci.index)] if len(wide_ci) else extreme
+            if len(narrow_ci):
+                print(f"\nNOTE: {len(narrow_ci)} extreme xi value(s) have a NARROW, non-zero-"
+                      f"crossing CI ({', '.join(narrow_ci['buoy'].tolist())}) - these look like "
+                      f"genuine, reliably-estimated site-specific depth-limiting, not noise. "
+                      f"Worth reporting with real confidence.")
 
 
 if __name__ == "__main__":

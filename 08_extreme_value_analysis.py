@@ -64,6 +64,41 @@ def return_level(u, sigma, xi, lam_per_year, return_period_years):
     return u + (sigma / xi) * (m ** xi - 1)
 
 
+def interpret_gpd_shape(xi: float, n_peaks: int) -> str:
+    """Physical interpretation of the GPD shape parameter - templated
+    text conditioned on parameters already computed (not new inference).
+    Thresholds match the classification this stage's print statements
+    already use. Explicitly flags the heavy-tail + few-peaks combination
+    as likely artifactual - the exact pattern found for real on
+    Blankenberge (xi=+0.327, CI crossing zero, only 43 peaks) via the
+    network-wide GPD cross-check, not a hypothetical case."""
+    if xi < -0.05:
+        return ("Bounded upper tail (finite maximum Hs implied) - "
+                 "consistent with a fetch-limited and/or depth-limited "
+                 "shelf sea, where wave growth is physically capped "
+                 "rather than open-ended.")
+    elif xi > 0.05:
+        interp = ("Unbounded (heavy) tail implied - physically implausible "
+                   "for a depth-limited shallow shelf sea, where waves "
+                   "cannot grow indefinitely.")
+        if n_peaks < 100:
+            interp += (f" With only {n_peaks} storm peaks, this is more "
+                        f"likely a small-sample estimation artifact than a "
+                        f"genuine finding - check Stage 12's bootstrap CI "
+                        f"before trusting this result (a CI crossing zero "
+                        f"would confirm it).")
+        else:
+            interp += (" Worth double-checking against Stage 12's bootstrap "
+                        "CI regardless, given how physically unusual this "
+                        "result would be if genuine.")
+        return interp
+    else:
+        return ("Roughly exponential tail - close to the boundary between "
+                 "bounded and unbounded. Check Stage 12's CI for this buoy "
+                 "specifically, since a result this close to zero is "
+                 "genuinely ambiguous about tail type without it.")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--buoy", default="WesthinderBuoy")
@@ -130,6 +165,8 @@ def main():
         print("xi > 0 -> heavy tail (no finite upper bound implied)")
     else:
         print("xi ~ 0 -> roughly exponential tail")
+    physical_interpretation = interpret_gpd_shape(shape, len(peaks))
+    print(f"Interpretation: {physical_interpretation}")
 
     ks_stat, ks_p = stats.kstest(excess, "genpareto", args=(shape, loc, scale))
     print(f"KS on exceedances vs fitted GPD: stat={ks_stat:.4f}, p={ks_p:.4f}")
@@ -164,6 +201,7 @@ def main():
             "ks_pvalue": float(ks_p),
             "lam_per_year": float(lam_per_year),
             "fit_reliable": bool(len(peaks) >= 10),
+            "physical_interpretation": physical_interpretation,
         }, f, indent=2)
 
     # --- Plot: declustered peaks over the series ---

@@ -1157,63 +1157,320 @@ same harness, rather than duplicating the walk-forward logic four
 times. Start with Westhinder only (cleanest, longest, most-validated
 record in the whole network) before generalizing to other buoys.
 
-## Priority 7 — Provenance metadata (cheap, do whenever there's a gap)
+## GPD shape parameter — external literature cross-check, NEW action item
 
-Not urgent relative to Priorities 1-3, but cheap enough to slot in
-anytime, including mid-way through tomorrow if there's a natural pause
-(e.g. while a batch run or CDS download is in progress). From today's
-external review — the single most directly actionable suggestion in it.
+From an external review: internal cross-validation (three-plus analyses
+agreeing on something) is good practice but stays self-referential -
+worth anchoring at least one finding against a published external
+source rather than only against this project's own other stages.
 
-Attach to every stage's output JSON: git commit hash, Python version,
-key package versions (statsmodels/scipy/pandas), input file hash or
-mtime, random seed used, execution timestamp. Given today included
-three separate wrong-API-guess corrections against `copernicusmarine`,
-having exact package-version provenance on every run would have made
-pinning down "which version's signature am I actually looking at"
-faster. Implementation: a small `utils.get_provenance()` helper, called
-once per script, merged into whatever summary JSON that stage already
-writes — not a new file per stage.
+**Done**: found a directly relevant published reference - Caires
+(2011), JCOMM Technical Report No. 57 (WMO/IOC), a shallow-water North
+Sea GPD analysis (Schiermonnikoog noord buoy, 19m depth, comparable
+shelf conditions to the BCZ). Reported xi = -0.12 to -0.13 (95% CI:
+-0.37, 0.09), vs. -0.07 to -0.08 for a deep-water comparison site
+(NDBC 46005, Pacific, 2780m). The paper's own explanation for the
+shallow/deep difference: shallow-water waves are depth-limited -
+**the exact physical mechanism already hypothesized for this
+project's own bounded-tail finding**, now with independent published
+confirmation of the sign and general shallow-water magnitude, not just
+internal agreement.
 
-## Priority 8 — Physical interpretation stage
+**Real discrepancy worth checking, not glossing over**: this network's
+GPD xi range (-1.31 to -0.04, per the README) extends far more negative
+than the published shallow-water reference point (-0.13). Two
+non-exclusive explanations:
+1. Several BCZ buoys are plausibly shallower than the 19m reference
+   site (Nieuwpoort, Blankenberge, Zeebrugge-area) - genuinely stronger
+   depth-limiting could be real, not an artifact.
+2. The most extreme xi values may be the same small-peak-count buoys
+   already known to have unreliable, wide confidence intervals (e.g.
+   A2Buoy's CI crossed zero even at a properly window-corrected EVA
+   run).
 
-Cheap and low-risk: templated text conditioned on parameters already
-computed (not new inference), translating e.g. `xi < 0` into "bounded
-tail, consistent with fetch-limited shelf sea" the way this plan and the
-README already do in prose. Genuinely useful for anyone reading Stage 08
-output who isn't fitting GPDs for a living. Could live as an extra
-printed block in `08_extreme_value_analysis.py` and `06_distribution_fit.py`
-rather than a new stage.
+**RESOLVED - real network run, and it's a bigger finding than
+expected.** The old -1.31 extreme was itself stale, from BEFORE
+today's Stage 08/11b fix (dynamic declustering window per buoy). The
+corrected, properly-declustered network run gives a dramatically
+tighter range: **-0.544 to +0.327** - the fix itself already resolved
+most of this concern, not just a footnote to it.
 
-## Priority 9 — Stage X: four-question diagnostics report
+**Real outlier is Blankenberge, not the most-negative buoy**: the ONLY
+positive xi in the network (+0.327, CI crosses zero), with both the
+fewest storm peaks (43) AND the shortest record (2.77 years) of any
+buoy. Positive xi implies an unbounded tail - physically implausible
+for depth-limited shallow-sea waves. Near-certainly a small-sample
+artifact. **The automated cross-check missed this** (tuned for
+|xi|>0.5, Blankenberge's magnitude is 0.327) - worth extending the
+check to also flag positive xi specifically, since that's the
+physically implausible direction regardless of magnitude.
 
-From the external review, distinct from the fingerprint idea (Priority
-10) — a narrative summary, not a numeric table. Four questions per
-buoy: can I trust the data (QC/gaps), can I trust the assumptions
-(stationarity/dependence/fit), can I trust the estimates (CI/stability),
-what did I learn about the physics (storms/persistence/regimes/spatial).
-Complements the tiering/CI machinery rather than duplicating it. Bigger
-lift than 7/8 — do after Priority 2/3 (multi-year validation) are done,
-since it should report on real multi-year results, not the 2-month
-window.
+**Raversijde1Buoy (xi=-0.544, the most negative) - automated flag was
+slightly overstated, worth correcting**: CI is [-0.929, -0.271] - wide
+(0.658), but entirely NEGATIVE, doesn't cross zero. That's not "likely
+artifact," it's "confidently bounded, imprecisely estimated" (67
+peaks, second-fewest in network) - a real distinction the check's
+OR-based logic (`wide CI OR crosses zero`) blurred together. Consider
+splitting these into separate messages if this check gets used again.
 
-## Priority 10 — Statistical fingerprint (now unblocked)
+**The reliable core of the network** (many peaks, narrow CIs -
+Trapegeer, ScheurWielingen, AkkaertSouthwest, Wandelaar) clusters
+tightly around **-0.27 to -0.32** - still ~2x more negative than
+Caires's shallow-water reference (-0.12 to -0.13), down from the old
+~10x gap, and now explicable as BCZ buoys being shallower/more
+depth-limited than that reference site's 19m, rather than a
+methodology concern.
 
-Previously parked pending uncertainty quantification — that prerequisite
-is satisfied now that Stage 12/13 exist. One-page-per-buoy: distribution,
-storm stats, persistence, CI, stability, all in one place. Still behind
-7-9 in priority. Clustering across buoy fingerprints: PCA or classical
-MDS, not UMAP (n=19 too small for UMAP to mean anything - unchanged
-from the earlier assessment of this idea).
+**Action item, still open**: update `README.md`'s findings summary,
+which currently states the stale "-1.31 to -0.04" range - replace with
+the corrected range and the Blankenberge/Raversijde1 nuance above.
 
-## Priority 11 — Assumptions-per-test summary
+## Priority 7 — Provenance metadata — BUILT and tested, one stage wired in as the pattern
 
-Lower value than it initially looks: significant overlap with
-information already scattered across existing summary JSONs (Stage 03's
-ADF/KPSS agreement flag, Stage 06's KS caveat, Stage 08's peak-count
-reliability flag). Only worth building if it actually *consolidates*
-those into one place rather than adding a fourth place the same
-information lives — otherwise it's restating existing output with extra
-steps.
+`utils.get_provenance(input_path=None, random_seed=None)` added:
+timestamp, Python version, key package versions (numpy/pandas/scipy/
+statsmodels/xarray/matplotlib/arch/scikit-learn/copernicusmarine/
+cdsapi - gracefully `None` if not installed, not an error), git commit
+hash + working-tree-dirty flag, and an input-file fingerprint
+(mtime+size, not a full content hash - deliberate tradeoff, stated in
+the docstring: hashing a 500k+ row CSV on every run would cost real
+time for a "did this change" question mtime+size already answers
+correctly for every realistic scenario here).
+
+**Tested properly, not just run once**: git hash retrieval and dirty-
+tree detection verified in an isolated real git repo (not just this
+sandbox, which isn't a git clone and correctly returns `None`) - clean
+tree correctly detected as clean immediately after a commit, correctly
+detected as dirty after modifying a tracked file. Caught my own test
+design flaw along the way (first attempt copied `utils.py` into the
+test repo, which made an untracked file that correctly counted as
+"dirty" for the wrong reason) and fixed the test, not the code - worth
+remembering that a surprising test result isn't always a code bug.
+
+**Wired into Stage 01 (`01_load_clean.py`) as the worked example**, not
+all ~25 scripts at once - deliberate scope limit given this needs real
+validation on the actual HPC repo (git hash population specifically)
+before blindly copying the same one-line pattern everywhere.
+Verified end-to-end: runs cleanly, provenance block appears correctly
+in the real output JSON alongside everything else Stage 01 already
+reports.
+
+**CONFIRMED on the real HPC environment - Priority 7 fully closed.**
+`git_commit_hash` populated correctly (real 40-char SHA-1, verified
+programmatically not just eyeballed), `git_working_tree_dirty=true`
+correctly reflecting real uncommitted state, `copernicusmarine`/`cdsapi`
+versions populated (2.4.1/0.7.7) where the sandbox had shown `null`
+(never installed there). Real environment differences already visible
+in the first real run - Python 3.10.20 (HPC) vs 3.12.3 (dev sandbox),
+and a notable `pandas` version gap (2.3.3 vs 3.0.2, a real major-version
+jump with actual breaking changes in places) - a concrete, immediate
+demonstration of why this was worth building, not just a nice-to-have.
+
+**Next natural extension, not done yet**: the actual copernicusmarine
+API-signature surprises that motivated this whole priority happened in
+the DOWNLOAD scripts (`download_belgian_wave_buoys_history.py`,
+`download_era5_meteo.py`), not in the numbered analysis stages -
+worth prioritizing provenance tracking there specifically over further
+analysis-stage rollout, since that's literally where the pain occurred.
+Otherwise, the same 2-line pattern can be copied to other stages
+incrementally whenever convenient, per the original "cheap enough to
+slot in anytime" framing.
+
+## Priority 8 — Physical interpretation stage — BUILT and tested
+
+Added as extra printed blocks + small JSON outputs in
+`08_extreme_value_analysis.py` (`interpret_gpd_shape()`) and
+`06_distribution_fit.py` (`interpret_distribution()`), not a new stage
+- exactly as scoped.
+
+**Stage 08's GPD interpretation is directly calibrated by today's real
+Blankenberge finding**, not generic textbook text: heavy tail (xi>0.05)
+combined with few peaks (<100) explicitly triggers a small-sample-
+artifact warning recommending the Stage 12 CI check - tested against
+all three real buoy shapes from today's actual network run
+(Westhinder-like bounded, Blankenberge-like heavy-tail-few-peaks,
+A2Buoy-like near-zero) plus a positive-control case (heavy tail with
+many peaks, which correctly gets a softer "worth double-checking"
+message instead of the artifact warning) - all four produced the
+right, distinctly-worded interpretation. Verified end-to-end through
+the real script (not just the isolated function) on a synthetic
+fixture - appears correctly in both console output and the saved JSON.
+
+**Stage 06's lognormal interpretation is similarly earned, not
+generic**: explicitly cites Stage 13's real Westhinder finding (every
+calendar-era window individually preferred Weibull, yet the pooled
+record came out lognormal) as the reason to check Stage 13 before
+trusting a lognormal win as a clean physical result. Weibull/Rayleigh
+get straightforward physical reads. Tested end-to-end on genuinely
+lognormal-shaped synthetic data - correctly triggers the caveat, saved
+to a new dedicated `_fit_interpretation.json` rather than disturbing
+the existing `fit_summary.csv` schema `summarize_results.py` already
+depends on.
+
+**Field-tested on real data, both branches of the logic confirmed**:
+Westhinder's Stage 06 run correctly triggered the lognormal/Stage 13
+caveat for real (not just synthetic). BlankenbergeBuoy's Stage 08 run
+correctly triggered the small-sample-artifact warning for real
+(xi=0.2955, 69 peaks) - independently corroborated by its own return
+levels (17.38m at 50 years, physically absurd for this coast) and the
+`<2x record length` illustrative-only flags on most of its return
+periods.
+
+**Clarification worth remembering, found during field-testing, not a
+bug**: running a stage script standalone (directly from the command
+line) does NOT inherit `run_all_buoys.py`'s dynamic per-buoy argument
+injection (Stage 08's persistence-based `--min-separation-hours`,
+Stage 10's `--include-period`) unless passed explicitly. A standalone
+Westhinder EVA run defaulted to 48h separation (1031 peaks, xi=-0.2315)
+instead of the network run's actual 231.4h-declustered result
+(483 peaks, xi=-0.3629) - both are "correct" outputs for what was
+actually asked, but only one matches the real network's numbers.
+Similarly, BlankenbergeBuoy's standalone run reported 69 peaks at the
+default 48h separation, not the 43 peaks the earlier network batch run
+found at its own dynamically-injected window - same cause, don't be
+surprised if a standalone re-run of any buoy doesn't exactly match its
+number from a full `run_all_buoys.py` pass unless the same arguments
+are passed explicitly.
+
+## Priority 9 — Stage X: four-question diagnostics report — BUILT and tested
+
+`22_diagnostics_report.py` synthesizes across ~12 stage outputs
+(01, 03, 03b, 05, 06+interpretation, 07, 08+interpretation, 10, 11,
+11b, 12, 13) into four narrative paragraphs per buoy, reading gracefully
+- doesn't compute anything new, doesn't require every stage present.
+
+**Tested for the more important property first**: zero stage outputs
+present (a buoy nothing has been run for yet) - correctly reports "not
+run" for every question instead of crashing. Then tested with a
+realistic partial fixture (Stage 01/03/06/08/11b present, Stage 12/13
+deliberately absent) - correctly synthesizes the present stages into
+readable prose AND correctly flags the missing uncertainty
+quantification with an explicit caveat rather than silently omitting
+it or leaving a blank section. Saved markdown output verified
+well-formed.
+
+**Field-tested on Westhinder (full stage history) - excellent result,
+with two real bugs found and fixed along the way.** Every number in
+the real report cross-checked exactly against prior real runs (16.3%
+missing, 345 segments/61.4%/50 used, M2 ratio 642.4->24.3, xi=-0.363/
+483 peaks, CI [-0.518,-0.319], persistence 115.7h - all matched
+precisely). But two sections were silently empty that shouldn't have
+been: Stage 13 (moving-window stability) and Stage 11 (spatial
+cluster), given both had genuinely been run for Westhinder. Checked
+rather than assumed "not run" was the real reason - it wasn't:
+
+1. **Stage 13's actual field is nested and a fraction, not flat and a
+   percentage**: script assumed `stab.get("pct_windows_agree_with_overall")`,
+   the real structure is `stab["window_stability"]["fraction_windows_agreeing"]`
+   (0-1 scale). Fixed - now correctly navigates the nested key and
+   converts to percentage for display.
+2. **Stage 11's actual filename has a `{var}_` prefix the script
+   didn't account for**: assumed `buoy_clusters.csv`, real file is
+   `{var}_buoy_clusters.csv` (e.g. `VHM0_buoy_clusters.csv`). Fixed.
+
+Both re-tested against fixtures matching the CONFIRMED real schema
+(not guessed a second time) before trusting the fix - Stage 13 test
+correctly showed 25% agreement (plausibly matching Westhinder's
+original, pre-calendar-windowing-fix Stage 13 result from earlier in
+the project), Stage 11 test correctly identified singleton cluster
+status. **General lesson worth remembering**: graceful degradation
+("if the file/field isn't there, say so cleanly") is the right design,
+but it also means a wrong assumed schema fails SILENTLY as "stage not
+run" instead of loudly as a crash - worth spot-checking a full-history
+buoy specifically to catch this category of bug, not just partial
+synthetic fixtures where "empty section" and "wrong schema" look
+identical from the outside.
+
+## Priority 10 — Statistical fingerprint — BUILT and tested
+
+`23_statistical_fingerprint.py`, two modes: single-buoy (one-page visual
+- text summary, regime-fraction bar chart, xi+CI error bar) and
+`--network` (fingerprint table across all discovered buoys + PCA 2D
+visualization + KMeans clustering by STATISTICAL similarity - a
+genuinely different lens than Stage 11's correlation-based spatial
+clustering: two buoys could be geographically uncorrelated but
+statistically similar, or vice versa). All fields read from schemas
+CONFIRMED against actual stage source code before use, not guessed -
+applying Priority 9's lesson from the start rather than repeating the
+same mistake.
+
+**Real bug found and fixed via testing, not assumed correct**: initial
+version hardcoded `n_clusters=4` regardless of dataset size. Tested on
+a deliberately-differentiated synthetic set (6 buoys, 2 clean groups -
+3 "calm/low-persistence", 3 "stormy/high-persistence") specifically to
+check whether clustering recovers real structure, not just "runs
+without crashing" - it over-split into 4 clusters instead of the true
+2 (no cross-contamination between the true groups, but not the clean
+split that existed). Fixed by selecting k via silhouette score across
+a range instead of a fixed guess - re-tested, now correctly and
+exactly recovers the true 2-group structure (silhouette=0.743, zero
+misclassification). This k-selection issue would likely have been
+invisible at the real n=19 scale (where a fixed k=4 happens to be
+plausible, similar to Stage 11's own 4 geographic clusters) - worth
+remembering that a bug can hide at production scale and only surface
+at a smaller, deliberately-designed test size, which is exactly why
+that test was worth building rather than only testing at "realistic"
+scale.
+
+**Real network run (19 buoys, k=5, silhouette=0.346)**: three findings,
+each independently interesting - Zeebrugge its own cluster, Blankenberge
+its own cluster, CadzandBoei+Deurlo paired separately from everyone
+else. Two large clusters (6 vs. 9 buoys) suspiciously tracked
+deployment era (shorter-record buoys vs. longer-record ones) rather
+than obviously-behavioral properties - `record_years`/`pct_missing`
+were included as raw features alongside genuinely behavioral ones,
+risking exactly this confound.
+
+**`--exclude-record-length` re-run - a real correction, not just
+confirmation.** Prediction was partially right, partially wrong in an
+informative way:
+- The 6-vs-9 deployment-era split **dissolved completely** as
+  predicted - confirms it was a data-availability artifact.
+- **CadzandBoei+Deurlo's pairing survived, and got STRONGER**
+  (silhouette improved 0.346->0.391 after exclusion) - now the more
+  defensible finding of the two, not a weaker one. Consistent with the
+  original instrument-class hypothesis from the very start of this
+  project (10-min sampling, VTPK/VMDR sensor set).
+- **Zeebrugge and Blankenberge's singleton status did NOT survive** -
+  both absorbed into one 17-buoy cluster. Not predicted, and requires
+  walking back part of the earlier framing, not just noting a null
+  result:
+  - **Zeebrugge**: this fingerprint-clustering result should be
+    downgraded from "confirms" to "was ambiguous, driven by
+    record-length/missingness metadata (14.3yr, 20.8% missing - both
+    real outliers among the 19 buoys) rather than core behavioral
+    properties this method can detect." The other independent lines of
+    evidence (tidal notch failure, correlation-based spatial cluster,
+    Stage 13 instability, wind-coupling collapse) are unaffected - none
+    of them depend on this feature set, so Zeebrugge's overall case
+    doesn't weaken, but this specific piece of evidence for it does.
+  - **Blankenberge**: disappearing here is actually CONFIRMATORY, not
+    contradictory - consistent with the GPD xi cross-check's own
+    conclusion that Blankenberge is a small-sample artifact (shortest
+    record, fewest peaks, widest CI), not a genuine physical outlier.
+    Losing its distinctiveness once the most direct record-length
+    proxies are removed is exactly what that conclusion predicts.
+
+**Lesson worth keeping**: a check that changes a conclusion (Zeebrugge
+downgraded here) is more valuable than one that only confirms it -
+worth remembering when deciding whether a "the result didn't replicate
+under a stricter test" finding is a failure or the check doing its job
+correctly.
+
+## Priority 11 — Assumptions-per-test summary — SUPERSEDED, not built separately
+
+Per this priority's own stated condition ("only worth building if it
+actually consolidates... otherwise it's restating existing output with
+extra steps"): **Priority 9's diagnostics report already does exactly
+this consolidation**. Its "Can I trust the ASSUMPTIONS?" section
+already pulls together Stage 03's ADF/KPSS agreement, Stage 06's
+interpretation (which carries the KS-validity caveat), Stage 03b's M2
+notch quality, Stage 05's Ljung-Box result, and Stage 07's ARCH
+detection - built and field-tested on real data. Building a second,
+separate script for the same purpose would violate the very condition
+that justified building this one at all. Closed without building,
+deliberately - the right call here is recognizing redundancy, not
+padding out a checklist.
 
 ## Explicitly rejected from the external review — do not build
 

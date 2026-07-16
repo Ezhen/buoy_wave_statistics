@@ -40,6 +40,39 @@ def fit_and_test(data, name, dist):
     return {"name": name, "params": params, "ks_stat": ks_stat, "ks_pvalue": ks_p, "ad_stat": ad_stat}
 
 
+def interpret_distribution(best_name: str) -> str:
+    """Physical interpretation of which distribution won - templated
+    text conditioned on the fit already computed. Weibull/Rayleigh get
+    a clean physical read; lognormal gets an EARNED caveat, not a
+    generic one - based on this exact pipeline's own Stage 13 finding
+    that a lognormal "win" can arise purely from pooling multiple
+    distinct sub-periods, even when every individual sub-period is
+    genuinely Weibull. Confirmed for real on Westhinder (not a
+    hypothetical): every calendar-era window individually preferred
+    Weibull, yet the pooled full-record fit came out lognormal."""
+    if best_name == "weibull":
+        return ("Standard result for wind-generated wave heights in a "
+                 "fetch-limited or fully-developed sea - physically "
+                 "expected, not a surprising or ambiguous finding.")
+    elif best_name == "rayleigh":
+        return ("Special case of Weibull (shape parameter ~2) - consistent "
+                 "with narrow-banded, linear wave theory assumptions "
+                 "holding reasonably well at this site.")
+    elif best_name == "lognormal":
+        return ("Can indicate a genuine multiplicative physical process, "
+                 "but can ALSO arise purely from pooling multiple distinct "
+                 "sub-populations (different storm regimes, seasonal "
+                 "climate shifts) into one fit - confirmed for real on this "
+                 "exact pipeline (Westhinder): every individual calendar-"
+                 "era window preferred Weibull, yet the pooled full-record "
+                 "fit came out lognormal (Stage 13 finding). Check Stage "
+                 "13's moving-window stability result for this buoy before "
+                 "treating a lognormal win here as a clean physical finding "
+                 "rather than a mixture artifact.")
+    else:
+        return f"No specific interpretation available for '{best_name}'."
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--buoy", default="WesthinderBuoy")
@@ -61,6 +94,8 @@ def main():
 
     best = min(results, key=lambda r: r["ks_stat"])
     print(f"\nBest KS fit (lowest statistic): {best['name']}")
+    physical_interpretation = interpret_distribution(best["name"])
+    print(f"Interpretation: {physical_interpretation}")
     print("Note: with a few months of data, treat the p-value as a rough guide - "
           "compare the Q-Q plots below visually before committing to one.")
     print("CAVEAT (two separate reasons, not one): (1) the classical KS test assumes "
@@ -102,6 +137,11 @@ def main():
         for r in results
     ])
     summary.to_csv(out_dir / f"{args.buoy}_{args.var}_fit_summary.csv", index=False)
+
+    import json
+    with open(out_dir / f"{args.buoy}_{args.var}_fit_interpretation.json", "w") as f:
+        json.dump({"best_distribution": best["name"],
+                    "physical_interpretation": physical_interpretation}, f, indent=2)
 
     print(f"\nSaved plots + summary to {out_dir}")
 
