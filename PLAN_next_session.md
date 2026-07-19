@@ -1518,3 +1518,166 @@ padding out a checklist.
 3. Once Westhinder looks right, full `data_multiyear` batch run
 4. Priority 3 (Mann-Kendall/STL) on the 6 long-record buoys, if time
    allows - otherwise this is the natural start for the session after
+
+## Post-priority extension: HMM regime identification (Stage 24) — BUILT and tested
+
+From a signal-processing-methods review: of the suggested additions
+(Kalman/state-space, particle filters, wavelets, matched filtering,
+Wiener filtering, HMM, Bayesian change-point detection, robust
+statistics, SSA, ICA, EMD, total variation denoising, Gaussian
+processes, sequential Monte Carlo), most don't fit this project's
+identity as a characterization framework rather than a real-time
+estimation one. Three were judged genuinely well-motivated by specific
+open questions already in this project (not generic domain popularity):
+HMM (extends Stage 10, cheapest), Bayesian change-point detection
+(directly addresses the Westhinder drift question - Mann-Kendall tests
+for smooth trend, a discrete step-change is a different hypothesis it
+can't detect), and SSA (could address Zeebrugge's unresolved compound-
+tide/time-varying-parameter hypotheses, harder to implement - Hankel
+embedding at real record scale needs truncated/randomized SVD, and
+still needs the longest-segment restriction like everything else at
+Zeebrugge). Kalman/state-space, wavelets, and the rest were judged
+either off-mission or not motivated by a specific question here, per
+the review discussion.
+
+**HMM built first (cheapest, easiest reuse of existing infrastructure)**.
+`24_regime_hmm.py`, using `hmmlearn.GaussianHMM`. Extends Stage 10's
+static regime fractions with TRANSITION PROBABILITY structure - given
+you're in a storm regime, what's the probability you're still in one
+next timestep - which neither Stage 10 (no memory) nor 11b (one
+aggregate Hs timescale, not per-regime) can answer.
+
+**Critical design point, verified empirically before trusting it, not
+assumed from documentation**: `hmmlearn`'s `lengths` parameter is
+required to fit on contiguous segments separately, for the same reason
+nearly every lag-based stage in this pipeline needed gap-awareness.
+Tested directly: on a 50-segment synthetic case with a deliberate
+state-mismatch at every segment boundary, omitting `lengths` produced
+spurious cross-state transition probability of ~0.025 (material
+contamination); with `lengths`, the same spurious transitions were
+numerically zero (~1e-134). Confirmed the effect scales with segment
+count via a negative control - matters MORE on a heavily-fragmented
+record (Westhinder: 1905 segments) than a lightly-fragmented one,
+opposite of what an unaware implementation might assume.
+
+**Validated end-to-end with a known transition structure**: synthetic
+4-state Markov chain with specified transition probabilities (true
+dwell times 200/100/66.7/50 samples) and realistic injected gap
+fragmentation (28 segments after cleaning). Recovered regime means
+essentially exact (true [0.5,1.2,2.2,3.5] vs. recovered
+[0.500,1.203,2.199,3.493]); recovered dwell times within 5-18% of true
+values (largest error on the stickiest regime, which has the fewest
+independent excursions to estimate from - expected finite-sample
+behavior, not a flaw); the tridiagonal transition structure (only
+adjacent regimes connect in the true generating process) was correctly
+recovered with near-zero probability on every non-adjacent "skip"
+transition.
+
+**Run it**:
+```bash
+python 24_regime_hmm.py --buoy WesthinderBuoy --var VHM0
+```
+
+**Real result on Westhinder - prediction above was WRONG, and understanding
+why is the actually valuable part.** Ran: 697 segments, 96.6% of valid
+data used (notably better coverage than 11b's own 61.4%, since this
+stage has no analogue of 11b's `--max-segments` cap). Regime means
+cleanly separated and monotonic (0.40/0.73/1.17/2.05m, calm to storm).
+
+Dwell times: calm=26.1h, moderate=11.8h, energetic=11.5h,
+**storm=21.2h** - a U-shape, not the predicted monotonic decrease, and
+**11b's aggregate persistence (115.7h) is 4-10x LARGER than every
+single regime's dwell time**, not sitting between them as predicted.
+
+**Why the prediction was wrong - a real methodological distinction,
+not just an error to note and move on from**: 11b measures
+autocorrelation decay of the continuous Hs VALUE (how long until
+Hs(t) and Hs(t+k) stop being related); HMM dwell time measures how
+long Hs stays inside one DISCRETIZED bin. A smoothly, continuously
+evolving storm (Hs climbing steadily over ~2 days, then declining)
+keeps the raw signal highly autocorrelated throughout - driving 11b's
+long timescale - while that same smooth climb crosses several regime
+boundaries along the way, registering as multiple discrete HMM
+transitions despite nothing discontinuous happening physically. These
+are genuinely different quantities that happen to both get called
+"persistence" loosely; there was no real basis for expecting them to
+land in the same numeric range, and stating that expectation before
+thinking it through (rather than after) was the actual mistake, not
+just getting a number wrong.
+
+**The U-shape itself looks like a real, physically coherent finding,
+not noise**: calm and storm are the two "sticky" states (26.1h,
+21.2h); moderate and energetic are faster-transiting states Hs passes
+through on the way between them (11.8h, 11.5h) - consistent with
+weather systems having persistent baseline/peak states connected by
+faster ramp-up/ramp-down phases. ~21h for the PEAK portion of a storm
+(not the whole event) is physically plausible for this coast.
+
+**What held up correctly**: every non-adjacent "skip" transition came
+out at exactly 0.0000 - confirming the tridiagonal structure (Hs only
+ever moves through adjacent regimes, never jumps directly from calm to
+storm) is a genuine real property, not an artifact specific to how the
+synthetic validation test was constructed.
+
+**Not yet built**: Bayesian change-point detection (next, given its
+direct connection to the Westhinder drift question) and SSA (hardest,
+only worth the 1-2 session investment if there's real appetite to
+revisit Zeebrugge specifically).
+
+## Post-priority extension: Bayesian change-point detection (Stage 25) — BUILT and tested
+
+Directly targets the Westhinder drift question (README/METHODS.md
+Section 6, provisionally resolved via Mann-Kendall finding no trend) -
+but Mann-Kendall tests for a smooth monotonic trend, a different
+hypothesis than a discrete step-change (mooring relocation, sensor
+upgrade, processing-method change at a specific era boundary). A real
+step-change could exist even when Mann-Kendall correctly reports "no
+trend," since these are different questions, not the same question at
+different sensitivity.
+
+**Deliberate scope decision, not a shortcut**: uses PELT (via
+`ruptures`) with an L2 mean-shift cost model, not full MCMC-based
+Bayesian inference. PELT answers "does a change point exist, and
+roughly where" - the actual question here - without the added
+complexity of prior specification and convergence diagnostics a fully
+Bayesian version would need for the same practical answer, per the
+scoping decision made when this was first estimated.
+
+Penalty (controls how many change points get detected - higher =
+fewer, more conservative) is a real, acknowledged design choice, not
+hidden behind one arbitrary number: reported across a sweep of 4
+multipliers (0.5x/1x/2x/4x a BIC-style default) for both annual mean
+and annual p95 Hs, so sensitivity to this choice is visible.
+
+**Validated two ways, both informative**:
+1. Known injected step-change (level 1.0 -> 1.35 at year 15 of a
+   30-year synthetic record, true AR(1) noise on top): detected at
+   EXACTLY the true year, consistently across all 4 penalty levels, for
+   both mean and p95 series - no ambiguity, no near-miss.
+2. No-change control (flat level, only noise): correctly zero change
+   points at the default penalty and above. But at the most permissive
+   setting (0.5x), a SPURIOUS change point appeared at the record's
+   midpoint - a genuine false positive that the sweep design is
+   specifically meant to catch. This is a real demonstration that the
+   sweep isn't superfluous: if only the permissive setting had been
+   run and reported, this false positive would have looked like a
+   finding; because it only appears at the least conservative penalty
+   (not persisting across the sweep), the tool's own printed guidance
+   correctly flags it as the less-robust kind of result.
+
+**Run it on real Westhinder data**:
+```bash
+python 25_changepoint_detection.py --buoy WesthinderBuoy --var VHM0
+```
+The real test: does a change point appear anywhere in the annual mean
+or p95 series, and if so, does it persist across most/all penalty
+levels (robust) or only the most permissive one (likely noise, per the
+validated false-positive behavior above)? If nothing robust is found,
+that's a real, additional piece of evidence the Westhinder drift
+question is genuinely resolved - a second, differently-motivated method
+agreeing with Mann-Kendall's "no trend" conclusion, rather than the
+same test run twice. If something robust IS found, that would be a
+genuinely new finding Mann-Kendall structurally could not have
+surfaced, worth investigating against real deployment history metadata
+(the external-review suggestion from earlier - checking Westhinder's
+actual mooring/sensor history - would be the natural next step if so).

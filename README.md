@@ -213,7 +213,7 @@ that would have taken ~33 minutes now runs in ~11 seconds.
 
 | Stage | Script | Purpose |
 |---|---|---|
-| 0 | `01_load_clean.py` | Regularize grid, interpolate short gaps, sanity-bound, record available variables/record length |
+| 0 | `01_load_clean.py` | Era-aware grid regularization (detects and separately handles mid-record native sampling-rate changes and real long gaps between them), timestamp-snap before reindex (tolerant of ordinary telemetry jitter), interpolate short gaps, sanity-bound, record available variables/record length |
 | 1 | `02_eda_diagnostics.py` | Rolling stats, ACF/PACF, periodogram with M2 marked |
 | 2 | `03_stationarity_tests.py` | ADF + KPSS side by side |
 | 2b | `03b_tidal_notch.py` | Box-Cox + harmonic regression at M2 (+harmonics) |
@@ -237,6 +237,11 @@ that would have taken ~33 minutes now runs in ~11 seconds.
 | — | `19_forecast_arma_garch.py` | ARMA-GARCH: point forecast + calibrated prediction interval |
 | — | `20_forecast_armax.py` | ARMAX: ARMA + lagged ERA5 wind speed as exogenous regressor |
 | — | `21_forecast_exceedance.py` | Probabilistic "will Hs exceed threshold X in the next Nh" classification, optional wind feature |
+| — | `22_diagnostics_report.py` | Narrative four-question diagnostics synthesis, per buoy |
+| — | `23_statistical_fingerprint.py` | Single-buoy visual fingerprint + `--network` PCA/KMeans clustering across all buoys |
+| — | `24_regime_hmm.py` | HMM regime transition matrix + dwell times, extends Stage 10 |
+| — | `25_changepoint_detection.py` | PELT change-point detection on annual mean/p95, with penalty sweep and storm-season coverage cross-check to flag possible data-completeness artifacts |
+| — | `26_ssa_decomposition.py` | Singular Spectrum Analysis (trajectory-matrix SVD) — targets Zeebrugge's tidal-notch anomaly specifically; separates near-degenerate/compound periodicities a fixed-frequency harmonic model can't |
 
 **Why 06/08/12 use the raw level series, not the residual**:
 Rayleigh/Weibull/GPD describe Hs itself (positive, right-skewed); a

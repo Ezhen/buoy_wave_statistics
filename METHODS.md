@@ -116,7 +116,77 @@ Lagged ERA5 wind speed was added as an exogenous regressor to the ARMA mean equa
 
 Point forecasting was supplemented with a probabilistic reframing: the probability that Hs exceeds a given threshold (90th or 95th percentile of the buoy's own record) at any point within a forecast window (6, 12, or 24 h), via logistic regression on three features computed strictly from data at or before the forecast origin (current level, short-term trend, recent volatility — the latter motivated by the confirmed universal ARCH effect). Performance was assessed via Brier score (against a constant base-rate baseline) and ROC-AUC. At Westhinder, Brier skill scores of 0.42–0.68 and ROC-AUC of 0.83–0.97 were obtained across tested thresholds and horizons; a substantial fraction of this skill reflects the buoy's already-established strong persistence (Section 3.4) rather than new information. Addition of current wind speed as a fourth feature improved skill consistently at both buoys tested, without the horizon-decay predicted by a synthetic validation case, for the same reason identified in Section 5.4.
 
-## 6. Known limitations
+## 7. Post-priority signal-processing extensions
+
+Following an external methods review, three additional signal-processing
+techniques were evaluated as extensions beyond the original 23-stage
+scope, each targeting a specific unresolved question from earlier
+sections.
+
+### 7.1 Regime identification via Hidden Markov Model
+
+Stage 24 extends the GMM-based regime identification (Section 3.6) with
+an HMM, adding explicit transition-probability structure and dwell-time
+estimates per regime. At Westhinder, HMM regime dwell times were found
+to be substantially shorter (calm 26.1h, moderate 11.8h, energetic
+11.5h, storm 21.2h) than the aggregate persistence timescale from
+Section 3.4 (115.7h) - initially treated as a possible inconsistency,
+resolved as measuring genuinely different quantities: discrete-regime
+dwell time versus continuous-value autocorrelation decay.
+
+### 7.2 Change-point detection
+
+Stage 25 applies PELT (via `ruptures`) to annual mean and p95 Hs series,
+with a penalty sweep (0.5x-4.0x) to assess robustness, and a storm-season
+(Oct-Mar) coverage cross-check to distinguish a genuine physical shift
+from a data-completeness artifact - motivated by finding that annual
+coverage alone doesn't discriminate a calm-season gap from a storm-
+season one (two Westhinder segments with near-identical annual coverage,
+80.0% vs 80.4%, showed markedly different behavior; only the
+storm-season-specific breakdown, 77.1% vs 76.1%, correctly showed no
+discriminating difference either, ruling out coverage as the explanation
+on both axes tested).
+
+Applied network-wide (15 buoys clearing the 10-year minimum), no buoy
+other than Westhinder showed a change point in Westhinder's own
+2001-2006 window, despite four buoys having full temporal coverage over
+that exact period - evidence against a shared regional signal. The
+coverage-artifact explanation was independently ruled out via a NetCDF
+metadata audit (QC flags, file history, mooring position) that came back
+clean on every axis checked. The 2001-2006 dip at Westhinder remains
+unexplained by any tested artifact mechanism; deployment-history
+metadata beyond what CMEMS's served product retains would be the next
+avenue, not pursued further here.
+
+### 7.3 Singular Spectrum Analysis (SSA)
+
+Stage 26, the last of the three extensions, targets Zeebrugge's
+persistent tidal-notch failure (Section 6): fixed-frequency harmonic
+regression (Section 2.1) cannot represent a compound tide (e.g. MS4, a
+shallow-water overtide) or a genuinely time-varying tidal parameter,
+while SSA's data-driven trajectory-matrix decomposition can in
+principle separate either. Window length (600h) was chosen with a
+1.7x margin above the theoretical minimum needed to resolve M2 from S2
+(~354.4h, from their ~0.00282 cycles/hour frequency spacing). Validated
+against synthetic ground truth - single-sinusoid recovery, M2/S2
+separation at their exact true periods, a pure-noise scree control, and
+a full synthetic M2+S2+MS4 compound-tide scenario with correct automatic
+constituent labeling - before running on real Zeebrugge data.
+
+On the real (post-data-fix) record, no component matched M2, S2, or MS4
+across three independent runs on different contiguous-segment
+selections, despite this being the site where tidal-band energy should
+be strongest. One robust, non-tidal oscillatory pair was recovered
+consistently across all three runs at ~49.7h (~2.07 days;
+49.671h/49.671h/49.700h across the three), plausibly a synoptic
+weather-system timescale rather than anything tidal. The absence of any
+clean tidal-constituent pair, now free of the data-integrity issues
+identified in Section 8, is evidence favoring the time-varying-tidal-
+parameter hypothesis over the compound-tide hypothesis - a real
+sinusoidal overtide should separate cleanly under SSA the way the
+synthetic validation case demonstrated it can.
+
+## 8. Known limitations
 
 **Zeebrugge.** Five independent analyses (tidal-notch failure persisting across all tested harmonic and frequency configurations, Section 2.1; singleton spatial cluster reproduced on independent data windows, Section 3.8; unstable distribution-fit verdict across moving windows, Section 3.7; collapsed and sign-inverted wind–wave coupling, Section 4; harbor-interior, most-sheltered location in the network) indicate this buoy is dynamically distinct from the rest of the network, plausibly reflecting local wave conditions dominated by harbor geometry and vessel wake rather than open-water wind forcing. A statistical-fingerprint-based sixth line of evidence (Section 3.11) did not survive controlling for record-length/completeness confounds and is not counted toward this conclusion. Two mechanisms for the persistent tidal-notch failure remain untested: a compound shallow-water tidal constituent (e.g. MS4) not representable by a fixed-fundamental-frequency harmonic basis, and genuine multi-year drift in the effective tidal parameters.
 
@@ -125,3 +195,5 @@ Point forecasting was supplemented with a probabilistic reframing: the probabili
 **Record heterogeneity.** Deployment history is highly uneven across the network (1990–1997 start for 6 buoys, 2009–2021 for the remaining 13), and sensor configuration differs at two buoys (Section 1.1). Any cross-buoy comparison should account for the specific overlap period and sensor class involved rather than assuming uniform data characteristics across the network.
 
 **Text-mined external validation.** GPD shape parameter ranges were compared against one published external source (Caires, 2011); confidence in this comparison would benefit from a broader literature survey beyond the single reference used here.
+
+**Stage 01 data-integrity history.** Two bugs were identified and fixed in the raw-to-regularized cleaning stage during methods-extension work (Section 7): (1) a single assumed native sampling frequency per buoy silently fabricated interpolated data for any buoy whose true rate changed mid-record (8 of 19 buoys affected, confirmed up to 23.8% fabricated data on the worst case before the fix), and (2) exact-timestamp reindexing silently mismatched real samples carrying ordinary sub-minute telemetry jitter, network-wide. Both were caught via internal consistency checks (a `record_years` value that didn't match a known-correct figure; a component count in a downstream stage inconsistent with independently-confirmed coverage) rather than by any a priori review, which is worth noting as a general caution: a pipeline stage passing its own regression tests and producing plausible-looking downstream numbers is not sufficient evidence of correctness when the input data itself has structure (mixed sampling rates, real-world timestamp jitter) the tests didn't anticipate. All 19 buoys were re-run after both fixes; results in this document reflect the corrected pipeline.

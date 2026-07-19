@@ -3,6 +3,90 @@
 All notable changes to this repository, in the order they actually
 happened. Dates reflect real batch-run timestamps where available.
 
+## 2026-07-19 — Stage 01 data-integrity fixes (era-mismatch fabrication, jitter-driven false missingness); Stage 26 (SSA)
+
+### Fixed — `01_load_clean.py`
+- **Era-mismatch fabrication (8 of 19 buoys affected).** `regularize_and_clean`
+  previously assumed ONE native sampling frequency for a buoy's entire
+  record (the global mode of raw time diffs). Any buoy whose native rate
+  changed mid-record (found via a network-wide audit: A2Buoy,
+  AkkaertSouthwestBuoy, NieuwpoortBuoy, OstendEasternPalisadeBuoy,
+  ScheurWielingenBuoy, TrapegeerBuoy, WandelaarBuoy,
+  ZeebruggeZandopvangkadeBuoy — mostly a shared rate decrease around
+  2016-2021, consistent with a single network-wide operator telemetry
+  change rather than 8 independent events) had every real reading in
+  its non-dominant era silently fabricated via linear interpolation
+  across the mismatched grid, reported as 0% missing. Confirmed on real
+  Zeebrugge data: 23.8% of its full 605,091-sample record was fabricated
+  interpolation, concentrated almost entirely in 2018-2026 - the era that
+  looked best-covered. Fixed via `detect_sampling_eras()` +
+  per-era `regularize_and_clean_one_era()`, with adjacent same-rate runs
+  explicitly merged so a genuine long GAP between two same-rate stretches
+  (e.g. Zeebrugge's real ~2.93yr 2010-2012 outage) isn't misread as a
+  rate change and silently erased instead of represented as NaN - this
+  exact bug was caught and fixed within today's session, via a
+  `record_years` sanity check that didn't match the known-correct value.
+- **Timestamp-jitter false missingness (network-wide, not era-specific).**
+  The regularize step's `reindex` requires exact-second timestamp
+  matching; ordinary real-world telemetry jitter of even a few seconds
+  caused real samples to silently miss their grid slot and register as
+  missing/interpolated. Reproduced synthetically: ±3s of random jitter
+  alone produced 85.9% false missingness with zero real gap. Fixed by
+  snapping each raw timestamp to its nearest grid point
+  (`.index.round(freq)`) before reindexing; collisions are counted
+  (`n_snap_collisions`) rather than silently dropped. AkkaertSouthwestBuoy
+  showed an outlier collision rate (25,389, ~2.9% of its record) worth a
+  follow-up look - possibly irregular native cadence rather than simple
+  jitter.
+- Both fixes validated against synthetic known-answer cases (single-era
+  regression - byte-identical output to the pre-fix code; pure rate
+  change; gap + rate change combined; small vs large jitter) before
+  trusting real-data results, per this project's established discipline.
+  All 19 buoys re-run; every downstream stage depending on Stage 01
+  output for the 8 affected buoys (and, to a lesser extent, all 19, given
+  the jitter fix's broader scope) re-run and re-validated.
+
+### Added
+- `26_ssa_decomposition.py` — Singular Spectrum Analysis (trajectory-
+  matrix/Hankel SVD, truncated via `scipy.sparse.linalg.svds`), the third
+  and last post-priority signal-processing extension (alongside Stage 24
+  HMM and Stage 25 change-point), scoped for Zeebrugge's unresolved
+  tidal-notch anomaly. Validated against synthetic ground truth (single
+  sinusoid recovery, M2/S2 near-degenerate frequency separation, pure-
+  noise scree control, full synthetic M2+S2+MS4 compound-tide scenario)
+  before running on real data. Real result (post-fix, 2015-01 to 2016-09
+  contiguous segment, verified clear of both bugs above): no clean
+  M2/S2/MS4 pair recovered despite three independent runs; one robust,
+  reproducible non-tidal ~49.7h (~2.07 day) oscillatory pair recovered
+  consistently across three different segment selections (49.671h,
+  49.671h, 49.700h) - a genuine, well-resolved finding, not a fluke of
+  one window. Negative tidal-constituent result, now free of the data-
+  integrity confounds above, lends more weight to the time-varying-
+  tidal-parameter hypothesis over the compound-tide (MS4) hypothesis for
+  Zeebrugge's notch failure.
+- `check_sampling_interval_history.py` — audits a buoy's raw `.nc` TIME
+  array for native-interval changes by year, independent of Stage 01's
+  own regularization; this is what first surfaced the era-mismatch bug.
+- `inspect_netcdf_metadata.py` — dumps global/variable NetCDF attributes,
+  QC flag distributions and their correspondence to NaN in the value
+  array, and per-timestep position (mooring relocation check). Used to
+  rule out (for Westhinder) a QC-methodology or history-trail explanation
+  for the 2001-2006 change-point investigation; came back clean on all
+  five axes checked (annual + storm-season coverage, network cross-
+  reference, file history, QC-to-NaN correspondence).
+- `run_changepoint_batch.py` — discovers long-record buoys from Stage
+  01's own output (no hardcoded buoy list existed anywhere in the repo)
+  and batch-runs Stage 25 full-record + edge-trimmed (relative to each
+  buoy's own record start, not a shared calendar year).
+- Stage 25 (`25_changepoint_detection.py`) extended with storm-season
+  (Oct-Mar) coverage checking (annual coverage alone doesn't discriminate
+  a calm-season gap from a storm-season gap - confirmed on real
+  Westhinder data, where two segments had near-identical annual coverage
+  but only one showed an anomalous mean) and segment-interior scanning
+  (not just years adjacent to a change-point boundary - the previous
+  boundary-only check missed 2003, the single most extreme year in
+  Westhinder's record, sitting mid-segment).
+
 ## 2026-07-09 — Initial pipeline (Westhinder pilot)
 
 ### Added
