@@ -37,6 +37,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+from utils import stage_eligible
+
 # Each entry: (script, arg_template, requirements)
 # requirements is one of:
 #   {}                                   -> Core, always eligible
@@ -68,26 +70,6 @@ STAGES = [
 
 def discover_buoys(data_dir: Path):
     return sorted(p.stem for p in data_dir.glob("*.nc"))
-
-
-def stage_eligible(requirements: dict, buoy_info: dict):
-    if not requirements:
-        return True, None
-    available = set(buoy_info.get("available_variables", []))
-    if "variables_any" in requirements:
-        needed = requirements["variables_any"]
-        if not any(v in available for v in needed):
-            return False, f"needs one of {needed}, buoy only has {sorted(available)}"
-    if "variables_all" in requirements:
-        needed = requirements["variables_all"]
-        missing = [v for v in needed if v not in available]
-        if missing:
-            return False, f"missing required variable(s) {missing}"
-    if "min_record_years" in requirements:
-        years = buoy_info.get("record_years", 0.0)
-        if years < requirements["min_record_years"]:
-            return False, f"record is {years:.3f} years, needs >= {requirements['min_record_years']}"
-    return True, None
 
 
 def build_stage10_args(base_args: list, buoy_info: dict):

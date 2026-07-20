@@ -30,3 +30,5 @@ __pycache__/
 .idea/
 *.swp
 0_*.py
+buoy_registry.json
+stage_registry.json

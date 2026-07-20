@@ -33,7 +33,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from scipy import stats
 
-from utils import default_paths, resolve_block_length, segments_by_time_gap
+from utils import default_paths, resolve_block_length, segments_by_time_gap_era_aware
 
 CANDIDATES = {
     "rayleigh": stats.rayleigh,
@@ -204,14 +204,18 @@ def main():
         # blocks spanning a real gap seam, treating two unrelated
         # calendar periods as if temporally adjacent. Segment by actual
         # elapsed time between rows first, then bootstrap within each
-        # segment only.
-        dt_hours = 0.5
+        # segment only. Era-aware: a single shared dt_hours threshold
+        # can't correctly serve a multi-era buoy - see
+        # segments_by_time_gap_era_aware's docstring for why a naive
+        # choice of which era's dt to use can silently fail to break at
+        # the era boundary itself, not just misjudge within-era gaps.
+        load_summary = {}
         load_summary_path = Path("pipeline_out/01_load_clean") / f"{args.buoy}_{args.var}_load_summary.json"
         if load_summary_path.exists():
             with open(load_summary_path) as f:
-                dt_hours = json.load(f).get("sampling_interval_hours", 0.5)
+                load_summary = json.load(f)
 
-        all_segs = segments_by_time_gap(regimes_series, dt_hours)
+        all_segs = segments_by_time_gap_era_aware(regimes_series, load_summary)
         min_len = max(5, block_length // 4)
         segs_used = [s for s in all_segs if len(s) >= min_len]
         coverage = sum(len(s) for s in segs_used)

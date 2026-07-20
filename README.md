@@ -258,6 +258,33 @@ network-wide — an ordinary/IID bootstrap or a classical Fisher z CI on
 this data would understate uncertainty. Block length and the
 effective-N correction both come from Stage 11b.
 
+## What question each stage answers
+
+The table above is organized by execution order — useful for running
+things correctly, since the numbering encodes real dependencies (11b
+runs before 04 because it needs the pre-differenced series). It's less
+useful for finding "which stage do I want" if you're starting from a
+question rather than a stage number. This is the same 26 stages,
+grouped by what they're actually for:
+
+| Question | Stages | What they establish |
+|---|---|---|
+| **Can I trust the observations?** | 0 (`01_load_clean`) | Era-aware regularization, gap classification, sanity bounds — everything below depends on this being right. Two real data-fabrication bugs were found and fixed here in-session (see `CHANGELOG.md`), which is exactly why this question comes first, not just conventionally. |
+| **What structures are present in the signal?** | 2, 2b, 3 (`03_stationarity_tests`, `03b_tidal_notch`, `04_transform_detrend`), 26 (`26_ssa_decomposition`) | Stationarity, tidal contamination, differencing order, and — where the fixed-frequency tidal model fails (Zeebrugge) — a data-driven decomposition that doesn't assume a fixed frequency at all. |
+| **How does the process behave?** | 1, 4, 4b, 5, 8 (`02_eda_diagnostics`, `05_whiteness_check`, `06_distribution_fit`, `07_arch_lm_test`, `10_regime_identification`), 11b, 24 | Marginal distribution, whiteness, volatility clustering, static regime fractions (10) vs. regime *dynamics* — transition probabilities and dwell times (24) — and the persistence timescale (11b) that several other stages (block length, decluster window) depend on downstream. |
+| **What happens under extremes?** | 6 (`08_extreme_value_analysis`), 25 | POT/GPD tail behavior and return levels; separately, whether the *underlying climate itself* has shifted over the record (change-point detection), which is a different question from "how heavy is the tail" — a shifted mean can look like a heavier tail if the two aren't distinguished. |
+| **How confident are the conclusions?** | 12 (`12_confidence_intervals`), 13 | Block-bootstrap CIs (autocorrelation-aware, not textbook-default — see above) and stability under perturbation: does the answer change across time windows, or if the single biggest storm is dropped? |
+| **Does this generalize across the network?** | 9, 12b (`11_spatial_statistics`, `12b_correlation_confidence`) | Cross-buoy correlation structure, and whether apparent differences between buoys are real or just sampling noise once autocorrelation-corrected CIs are applied. |
+| **Is anything changing over time?** | 14, 15, 16 (`14_mann_kendall_trend`, `15_seasonal_decomposition`, `16_wind_wave_coupling`) | Long-term trend, seasonal cycle, and coupling with the physical driver (wind/pressure) — three different senses of "changing," not interchangeable. |
+| **Can the near future be predicted?** | 17–21 (forecasting stages) | Point forecasts (persistence → ARMA → ARMA-GARCH → ARMAX) and a probabilistic reframing (exceedance) — see [Forecasting](#forecasting-stages-17-21) below. |
+| **What's the overall picture, and is it trustworthy?** | 22, 23 (`22_diagnostics_report`, `23_statistical_fingerprint`) | Per-buoy narrative synthesis and cross-buoy visual/statistical fingerprinting — the stages that read *other stages'* outputs rather than raw data, closest to a "final report" layer. |
+
+This grouping is documentation only — it doesn't change how anything
+runs. If a stage doesn't cleanly fit one question (11b genuinely serves
+both "how does it behave" and "how confident," since its persistence
+estimate feeds Stage 12/13's methodology directly), it's listed once,
+under the question it most directly answers.
+
 ## Findings summary
 
 - **Tidal contamination** has a real spatial gradient (6x-135x raw M2

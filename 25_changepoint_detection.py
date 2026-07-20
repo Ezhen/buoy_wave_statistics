@@ -39,7 +39,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import ruptures as rpt
 
-from utils import default_paths
+from utils import default_paths, emit_warning
 
 
 def annual_coverage(hs_full: pd.Series) -> pd.DataFrame:
@@ -150,6 +150,7 @@ def main():
 
     out_dir = default_paths("25_changepoint_detection")
     summary = {"record_years": record_years, "years": years.tolist()}
+    warnings = []
 
     penalty_multipliers = [0.5, 1.0, 1.5, 2.0, 4.0]
 
@@ -215,9 +216,6 @@ def main():
         for y, r in coverage.iterrows()
     }
 
-    with open(out_dir / f"{args.buoy}_{args.var}_changepoint_summary.json", "w") as f:
-        json.dump(summary, f, indent=2)
-
     # Cross-reference: scan every year INSIDE each detected segment (not
     # just years adjacent to a change point boundary) against storm-season
     # coverage specifically. Annual coverage alone isn't sufficient here -
@@ -251,11 +249,23 @@ def main():
             avg_annual = coverage.loc[seg_years, "coverage_pct"].mean()
             avg_storm = coverage.loc[seg_years, "storm_coverage_pct"].mean()
             print(f"    [{lo}-{hi-1}] avg annual coverage {avg_annual:.1f}%, "
-                  f"avg storm-season coverage {avg_storm:.1f}%"
-                  + (f" -- LOW STORM-SEASON COVERAGE YEARS INSIDE SEGMENT: {seg_low}"
-                     if seg_low else ""))
+                  f"avg storm-season coverage {avg_storm:.1f}%")
+            if seg_low:
+                emit_warning(warnings, "warning", "low_storm_coverage_years_in_segment",
+                             f"segment [{lo}-{hi-1}] has low-storm-coverage year(s) inside "
+                             f"it: {seg_low} - possible data-completeness artifact rather "
+                             f"than confirmed signal for any change point bounding this "
+                             f"segment, until checked against raw coverage.",
+                             segment_start=lo, segment_end=hi - 1, low_coverage_years=seg_low,
+                             avg_annual_coverage_pct=round(avg_annual, 1),
+                             avg_storm_coverage_pct=round(avg_storm, 1))
     else:
         print(f"  No change points at default penalty - nothing to segment-check.")
+
+    summary["warnings"] = warnings
+
+    with open(out_dir / f"{args.buoy}_{args.var}_changepoint_summary.json", "w") as f:
+        json.dump(summary, f, indent=2)
 
     print(f"\n(Penalty is a real design choice - higher penalty finds fewer, more "
           f"conservative change points. The sweep above shows how sensitive the "

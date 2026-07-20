@@ -1,6 +1,6 @@
 # Pipeline Expansion — Plan for Next Session
 
-## Status as of today (2026-07-12, end of day)
+## Status as of today (2026-07-20, end of day)
 
 Priorities 1-3 from the previous version of this plan are **done**:
 dependence structure (11b, fixed), uncertainty/stability (12, 12b, 13),
@@ -1681,3 +1681,203 @@ genuinely new finding Mann-Kendall structurally could not have
 surfaced, worth investigating against real deployment history metadata
 (the external-review suggestion from earlier - checking Westhinder's
 actual mooring/sensor history - would be the natural next step if so).
+
+## Post-priority extension: SSA decomposition (Stage 26) — BUILT and tested
+
+Third and last of the signal-processing extensions (alongside 24/25),
+targeting Zeebrugge's persistent tidal-notch failure - Stage 03b's
+fixed-frequency M2 harmonic regression can't represent a compound tide
+(MS4) or a genuinely time-varying tidal parameter; SSA's data-driven
+trajectory-matrix decomposition can in principle separate either.
+
+Validated on synthetic ground truth before real data: single-sinusoid
+recovery (0.02% error), M2/S2 near-degenerate separation (both exact,
+clean w-correlation block-diagonal structure), pure-noise scree control
+(smooth decay vs. real signal's sharp drop, confirmed discriminating),
+full M2+S2+MS4 compound-tide scenario (all three recovered and
+auto-labeled correctly). Window length (600h) justified from the same
+frequency-resolution math already used for 03b's --fit-frequency claim
+(~354.4h floor to resolve M2 from S2; 600h gives 1.7x margin).
+
+**Real result on Zeebrugge, run three times on independently-fixed
+data as the underlying Stage 01 bugs got resolved (see below) - the
+final, trustworthy run**: no clean M2/S2/MS4 pair recovered in any of
+the three runs despite this being the site where tidal-band energy
+should be strongest. One robust non-tidal ~49.7h (~2.07 day) oscillatory
+pair reproduced across all three runs to within 0.06% (49.671h/49.671h/
+49.700h) - a genuine, well-resolved finding, plausibly a synoptic
+weather-system timescale. The tidal-constituent negative result, now
+free of the Stage 01 data-integrity confounds below, is real evidence
+favoring the time-varying-tidal-parameter hypothesis over the
+compound-tide (MS4) hypothesis - a real MS4 overtide should separate
+cleanly the way the synthetic validation demonstrated it can.
+
+## Stage 01 data-integrity bugs — found and fixed mid-session (2026-07-19/20)
+
+What started as "run SSA on Zeebrugge" surfaced three real, previously-
+invisible correctness bugs in the foundational cleaning stage. All
+found through internal consistency checks (a `record_years` value not
+matching a known-correct figure; a component count inconsistent with
+independently-confirmed coverage; direct empirical reproduction of a
+suspected splicing risk), not a priori review - consistent with this
+project's established pattern (see Priority 9's Stage 13/11 bugs above).
+
+1. **Era-mismatch fabrication (8 of 19 buoys affected)**: `01_load_clean.py`
+   assumed ONE native sampling frequency per buoy for the whole record.
+   Any buoy whose true rate changed mid-record had every real reading
+   in its non-dominant era silently fabricated via linear interpolation
+   across the mismatched grid, reported as 0% missing. Confirmed on
+   real Zeebrugge data: 23.8% of its full record was fabricated,
+   concentrated almost entirely in its most recent, best-looking decade.
+   Affected buoys (shared root cause, mostly a 2016-2021 rate decrease -
+   reads like one operator-side telemetry change across the network,
+   not 8 independent events): A2Buoy, AkkaertSouthwestBuoy,
+   NieuwpoortBuoy, OstendEasternPalisadeBuoy, ScheurWielingenBuoy,
+   TrapegeerBuoy, WandelaarBuoy, ZeebruggeZandopvangkadeBuoy.
+2. **Timestamp-jitter false missingness (network-wide, not era-specific)**:
+   the regularize step's exact-timestamp reindex silently mismatched
+   real samples carrying ordinary sub-minute telemetry jitter. Reproduced
+   synthetically: +/-3s of random jitter alone produced 85.9% false
+   missingness with zero real gap. Fixed by snapping each raw timestamp
+   to its nearest grid point before reindexing.
+3. **Era-boundary silent splicing (found while building the dt_hours
+   accessor for Phase 2 of the restructuring, below)**: a rate-change
+   transition with only a short natural seam (no real outage) concatenated
+   with ZERO NaN marker by default - confirmed empirically on the real
+   Zeebrugge seam timing (era1 ends 09:30, era2 begins 10:15, a 45-minute
+   gap) that real samples from two different sampling rates sat
+   immediately adjacent with nothing marking the transition.
+   `longest_contiguous_segment`/`all_contiguous_segments` (used by 11b,
+   13, 24, 26) would have silently mixed two different sampling rates
+   into one "contiguous" segment. Fixed: every era boundary now gets an
+   explicit synthetic NaN marker, unconditionally.
+
+Each fix validated against synthetic known-answer cases (byte-identical
+regression for unaffected single-era buoys; the specific bug reproduced
+and then shown fixed) before trusting real-data results. Full 19-buoy
+network re-run after all three fixes; every downstream stage consuming
+Stage 01 output for the 8 affected buoys re-run and re-validated
+(11b/13/24 specifically - see dt_hours fix below).
+
+**Follow-up bug fixed downstream**: 11b, 13, and 24 all read
+`sampling_interval_hours` directly from `load_summary.json` as a single
+lag/dt parameter - only the DOMINANT era's value, silently wrong for
+any segment actually analyzed from a non-dominant era. Fixed via
+`utils.get_dt_hours()` (era-aware lookup, proven to diverge from the
+naive value by a real, detectable 2x on a constructed case) and
+`utils.segments_by_time_gap_era_aware()` (splits gap-detection by known
+era window rather than trusting one shared threshold to correctly break
+at an era boundary - proven NOT reliable in general via a constructed
+20-minute-seam case that a naive coarser-era threshold would have
+missed). Stage 24 specifically needed a third fix: it trains its HMM on
+data CONCATENATED across segments, so mixing rates isn't just a wrong
+unit conversion - it blends the fitted transition probabilities
+themselves. Now detects mixed-rate segments, restricts training to the
+dominant-rate subset, and reports the excluded sample count explicitly
+rather than silently blending.
+
+**Still open, deliberately deferred**: the 8 affected buoys' Stage 24
+runs currently exclude their non-dominant era entirely (up to 42% of
+valid samples for Zeebrugge) rather than getting a second HMM fit on
+that excluded data. Real, unused information - not yet acted on.
+
+**AkkaertSouthwestBuoy flagged, not resolved**: 25,389 snap collisions
+in its 0.5h era (~2.9% of its record, 10-100x every other buoy) -
+pattern (collisions without a corresponding rise in missingness)
+suggests genuinely irregular native cadence or an overlapping data
+stream, not ordinary jitter. Never directly investigated.
+
+## Repository restructuring (Phases 0-3) — BUILT and tested
+
+Prompted by a stated observation that invocation/eligibility logic was
+independently reimplemented in 3+ places (`run_all_buoys.py`'s hardcoded
+list, `run_changepoint_batch.py`'s bespoke discovery, one-off shell
+loops). Scoped in 4 phases, sequenced by dependency:
+
+- **Phase 0**: moved the 3 reactive diagnostic tools (built earlier this
+  session) into `tools/`, with path-resolution fixes validated by
+  reproducing and then fixing the exact `ModuleNotFoundError` this
+  caused on the HPC. Built `tests/test_stage01.py`, transcribing this
+  session's throwaway synthetic validations into permanent pytest
+  coverage (10 tests) - the whole point being the next Stage 01
+  regression gets caught automatically instead of requiring someone to
+  rebuild the same cases by hand again.
+- **Phase 1**: `tools/build_buoy_registry.py` - aggregates every buoy's
+  `record_years`/`available_variables`/`multi_era_detected` into one
+  `buoy_registry.json`, plus a small manually-curated (explicitly marked
+  as such) known-quirks section. Validated against 4 synthetic fixtures
+  spanning the real eligibility cases.
+- **Phase 2**: the dt_hours/era-boundary fixes described above - found
+  while trying to build this phase safely, not planned in advance.
+- **Phase 3**: `tools/build_stage_registry.py` (AST-parses each stage's
+  own `--min-years` argparse default from source, closing the exact
+  drift risk a hand-maintained mirror dict would have - confirmed zero
+  false negatives via independent grep cross-check) and
+  `tools/run_stage.py` (generic runner: given a stage + var, discovers
+  eligible buoys from both registries via `utils.stage_eligible()`,
+  relocated from `run_all_buoys.py` as a pure move so both tools share
+  one eligibility implementation). Regression-tested by confirming it
+  selects the EXACT SAME buoy set as `run_changepoint_batch.py`'s
+  original bespoke discovery on an identical fixture. Validated on real
+  HPC data for two different stages (14, 25) across all 19 buoys -
+  every number cross-checked exactly against prior known-correct runs.
+
+**Deliberately NOT done**: `run_all_buoys.py`'s own default Stage 02-13
+batch is untouched - Stages 14+ are deliberately standalone per its own
+docstring, not something Phase 3 should silently fold into the default
+batch. `run_changepoint_batch.py` itself hasn't been migrated to wrap
+`tools/run_stage.py` - still works standalone, migration not yet done.
+Dynamic per-buoy argument builders (Stage 08's --min-separation-hours,
+Stage 10's --include-period style) not generalized into the new runner -
+no Stage 14+ script needs this yet.
+
+## Structured warnings convention — started, 2 of 26 stages retrofitted
+
+Prompted by an external review's suggestion (assumption tracking).
+`utils.emit_warning()` - one call site produces both the console
+print and a structured `{severity, code, message, context}` entry
+appended to a stage's own list, saved as `summary["warnings"]`.
+Retrofitted as proof-of-concept on Stage 15 (all 3 of its ad hoc
+NOTE/WARNING sites) and Stage 25 (the segment-interior low-storm-
+coverage flag). Real bug caught during the Stage 25 retrofit: its
+`json.dump` was happening BEFORE the code that would populate
+`warnings`, meaning the field would have silently saved empty every
+time - fixed by moving the write to after warnings are populated.
+
+**Deliberately incremental, not a retrofit of all 26** - convert a
+stage's prints to `emit_warning` calls next time it's touched for
+another reason, not as a standalone pass.
+
+Also added (zero code risk, documentation only): a `## What question
+each stage answers` section in README.md, regrouping all 26 stages by
+scientific question (trust the data / signal structure / behavior /
+extremes / confidence / network generalization / change over time /
+forecasting / synthesis) alongside the existing execution-order table.
+
+## Status as of 2026-07-20, end of session - open threads for next time
+
+In priority order, not urgency order (none of these are blocking):
+
+1. **AkkaertSouthwestBuoy's snap-collision anomaly** - never directly
+   investigated. Natural next step: `tools/check_sampling_interval_history.py`
+   against it specifically, looking at the raw diff distribution within
+   its confirmed 0.5h era rather than just the modal value.
+2. **Westhinder's 2001-2006 change-point** - every artifact explanation
+   tested has failed (coverage, QC, network cross-reference, file
+   history). Next step identified but not executed: direct inquiry to
+   MDK about deployment/mooring/sensor history at that station, citing
+   the sand-dynamics report's own "problems with the wave buoy"
+   precedent as grounds this is a known, taken-seriously failure mode
+   for this exact station.
+3. **Stage 24 non-dominant-era reruns** for the 8 multi-era buoys -
+   deferred by explicit request, not forgotten. Would need a second
+   invocation per affected buoy on just its excluded era's data.
+4. **`run_changepoint_batch.py` migration** to wrap `tools/run_stage.py`
+   instead of its own discovery - not urgent, current tool works fine.
+5. **`requirements.txt` placeholders** for copernicusmarine/cdsapi -
+   still open, carried over from before this session; not addressable
+   without direct HPC access to `pip show` output.
+6. **Broader literature grounding** - only Caires 2011 checked against
+   GPD xi findings so far.
+7. **Structured-warnings convention** - only 2 of 26 stages have it;
+   apply opportunistically when a stage is touched for another reason.

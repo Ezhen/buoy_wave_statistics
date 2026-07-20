@@ -46,7 +46,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from statsmodels.tsa.stattools import acf
 
-from utils import default_paths, all_contiguous_segments, integral_timescale
+from utils import default_paths, all_contiguous_segments, integral_timescale, get_dt_hours
 
 
 def main():
@@ -84,10 +84,11 @@ def main():
         s_full = pd.read_csv(raw_path, index_col=0, parse_dates=True)[args.var]
 
     load_summary_path = Path("pipeline_out/01_load_clean") / f"{args.buoy}_{args.var}_load_summary.json"
-    dt_hours = 0.5
+    load_summary = {}
     if load_summary_path.exists():
         with open(load_summary_path) as f:
-            dt_hours = json.load(f).get("sampling_interval_hours", 0.5)
+            load_summary = json.load(f)
+    dt_hours = load_summary.get("sampling_interval_hours", 0.5)  # dominant-era value, for the header print only - see per-segment lookup below
 
     all_segments = all_contiguous_segments(s_full, min_length=args.min_segment_length)
     n_found = len(all_segments)
@@ -105,7 +106,8 @@ def main():
 
     print(f"\n--- {args.buoy} / {args.var} dependence structure ---")
     print(f"Input series: {'detided (Stage 2b)' if used_detided else 'RAW (Stage 0)'}")
-    print(f"Sampling interval: {dt_hours}h")
+    print(f"Sampling interval: {dt_hours}h (dominant era - see per-segment values below "
+          f"if this buoy has more than one)")
     if n_found > 1:
         print(f"Record fragmented into {n_found} contiguous segments >= "
               f"{args.min_segment_length} samples; longest covers "
@@ -115,14 +117,35 @@ def main():
               f"- aggregating across all of them instead of discarding the rest.")
 
     # --- Per-segment integral timescale ---
+    # dt_hours is looked up PER SEGMENT, not once for the whole buoy -
+    # all_contiguous_segments can return segments from DIFFERENT eras on
+    # a multi-era buoy (a rate change doesn't stop a segment from being
+    # "contiguous" in the NaN sense once Stage 01's era-boundary-marker
+    # fix is in place; segments from either side of that marker are two
+    # separate, correctly-bounded contiguous runs). Using one shared
+    # sampling_interval_hours for both would silently apply the wrong
+    # dt to whichever segment isn't from the dominant era.
     per_segment = []
+    distinct_dts_used = set()
     for seg in segments_used:
+        seg_dt_hours = get_dt_hours(load_summary, seg.index[0]) if load_summary else dt_hours
+        distinct_dts_used.add(seg_dt_hours)
         tau, crit_lag, rho, band, hit_ceiling = integral_timescale(
-            seg.values, dt_hours, args.max_lag, args.consecutive)
+            seg.values, seg_dt_hours, args.max_lag, args.consecutive)
         per_segment.append({
             "n_samples": len(seg), "tau_hours": tau, "lag1_acf": float(rho[1]),
             "hit_ceiling": hit_ceiling, "start": str(seg.index[0]), "end": str(seg.index[-1]),
+            "dt_hours": seg_dt_hours,
         })
+
+    if len(distinct_dts_used) > 1:
+        print(f"\nNOTE: segments used span more than one sampling interval "
+              f"({sorted(distinct_dts_used)}h) - each segment's own dt was applied "
+              f"correctly, but this means 'samples' isn't a consistent unit across "
+              f"segments below. Hour-based figures (tau, decluster window) are still "
+              f"comparable; sample-based figures (block length) are not directly, "
+              f"which is why the suggested block length below uses the LONGEST "
+              f"segment's own dt specifically, not an average.")
 
     weights = np.array([p["n_samples"] for p in per_segment], dtype=float)
     taus = np.array([p["tau_hours"] for p in per_segment])
@@ -143,11 +166,18 @@ def main():
               f"--max-lag further if this matters, though each segment is still capped "
               f"at its own length//3.")
 
-    suggested_block_samples = max(1, int(np.ceil(tau_hours / dt_hours)))
+    # Block length in SAMPLES only makes sense relative to a single
+    # sampling rate - use the longest segment's own dt (per_segment is
+    # in the same order as segments_used, which all_contiguous_segments
+    # returns longest-first) rather than an average across possibly-
+    # differing rates.
+    block_dt_hours = per_segment[0]["dt_hours"]
+    suggested_block_samples = max(1, int(np.ceil(tau_hours / block_dt_hours)))
     suggested_decluster_hours = round(2 * tau_hours, 1)
 
     print(f"\nSuggested block bootstrap block length: {suggested_block_samples} samples "
-          f"({suggested_block_samples * dt_hours:.1f}h)")
+          f"({suggested_block_samples * block_dt_hours:.1f}h, using the longest segment's "
+          f"own {block_dt_hours}h sampling interval)")
     print(f"Suggested EVA declustering window: {suggested_decluster_hours}h "
           f"(2x integral timescale)")
     if suggested_decluster_hours > 48:
@@ -161,7 +191,9 @@ def main():
     with open(out_dir / f"{args.buoy}_{args.var}_dependence_summary.json", "w") as f:
         json.dump({
             "used_detided_input": used_detided,
-            "sampling_interval_hours": dt_hours,
+            "sampling_interval_hours": dt_hours,  # dominant era only - see per_segment for the real per-segment values
+            "distinct_dt_hours_used": sorted(distinct_dts_used),
+            "block_length_dt_hours": block_dt_hours,
             "lag1_acf": lag1_acf,
             "integral_timescale_hours": tau_hours,
             "suggested_block_length_samples": suggested_block_samples,
@@ -173,15 +205,16 @@ def main():
             "per_segment_tau_min_hours": float(taus.min()),
             "per_segment_tau_max_hours": float(taus.max()),
             "hit_max_lag_ceiling": bool(n_ceiling_hits > 0),  # kept for backward compat with consumers
+            "per_segment": per_segment,
         }, f, indent=2)
 
     # --- Diagnostic plot: the single longest segment's ACF (most informative one to look at) ---
     longest = segments_used[0]
     tau_l, crit_lag_l, rho_l, band_l, hit_ceiling_l = integral_timescale(
-        longest.values, dt_hours, args.max_lag, args.consecutive)
+        longest.values, block_dt_hours, args.max_lag, args.consecutive)
 
     fig, ax = plt.subplots(figsize=(10, 5))
-    lags_hours = np.arange(len(rho_l)) * dt_hours
+    lags_hours = np.arange(len(rho_l)) * block_dt_hours
     ax.plot(lags_hours, rho_l, lw=1)
     ax.axhline(0, color="gray", ls="-", lw=0.8)
     ax.axhline(band_l, color="gray", ls=":", lw=0.8, label=f"significance band (+/-{band_l:.3f})")

@@ -222,6 +222,33 @@ def regularize_and_clean(s: pd.Series, var: str):
     if dup.any():
         s_clean = s_clean[~s_clean.index.duplicated(keep="first")]
 
+    # CRITICAL: every era boundary must break contiguity for any
+    # downstream NaN-based segment-detection tool (longest_contiguous_
+    # segment, all_contiguous_segments - used by Stages 11b, 13, 24, 26),
+    # not only when a natural time gap happens to separate the two eras.
+    # Confirmed empirically this DOESN'T happen by default: two eras
+    # with only a short natural seam between them (e.g. Zeebrugge's real
+    # ~45-minute rate-change transition) concatenate with ZERO NaN
+    # marker - real samples from two different sampling rates sit
+    # immediately adjacent in the output, which a naive contiguous-run
+    # check cannot distinguish from genuinely continuous same-rate data.
+    # A single dt_hours value cannot correctly describe a segment that
+    # silently spans two eras, so this must be fixed here, not worked
+    # around downstream. Insert one synthetic NaN row strictly between
+    # every pair of adjacent eras' real boundary timestamps.
+    n_era_boundary_markers = 0
+    if len(era_series) > 1:
+        marker_rows = []
+        for i in range(len(era_series) - 1):
+            left_end = era_series[i].index.max()
+            right_start = era_series[i + 1].index.min()
+            if right_start > left_end:
+                marker_ts = left_end + (right_start - left_end) / 2
+                marker_rows.append(pd.Series([np.nan], index=[marker_ts], name=s_clean.name))
+        if marker_rows:
+            n_era_boundary_markers = len(marker_rows)
+            s_clean = pd.concat([s_clean] + marker_rows).sort_index()
+
     # Aggregate stats across eras, for backward compatibility with every
     # downstream stage that reads these top-level keys. The "dominant"
     # era (most raw samples) is reported as the top-level
@@ -234,7 +261,7 @@ def regularize_and_clean(s: pd.Series, var: str):
     n_missing_before_total = sum(r["n_missing_before_clean"] for r in era_reports)
     n_bad_total = sum(r["n_sanity_flagged_bad"] for r in era_reports)
     n_short_total = sum(r["n_short_gap_interpolated"] for r in era_reports)
-    n_long_total = sum(r["n_long_gap_left_as_nan"] for r in era_reports)
+    n_long_total = sum(r["n_long_gap_left_as_nan"] for r in era_reports) + n_era_boundary_markers
     longest_gap_hours_overall = max((r["longest_gap_hours"] for r in era_reports), default=0.0)
     longest_gap_samples_overall = max((r["longest_gap_samples"] for r in era_reports), default=0)
 
@@ -242,6 +269,7 @@ def regularize_and_clean(s: pd.Series, var: str):
         "inferred_freq": f"{dominant['inferred_freq_hours']} hours",
         "sampling_interval_hours": dominant["inferred_freq_hours"],
         "n_samples_regularized": len(s_clean),
+        "n_era_boundary_markers": n_era_boundary_markers,
         "n_missing_before_clean": n_missing_before_total,
         "n_sanity_flagged_bad": n_bad_total,
         "n_short_gap_interpolated": n_short_total,
@@ -295,10 +323,11 @@ def main():
               f"this buoy's sampling interval changed mid-record (see 'eras' in the saved "
               f"JSON for exact boundaries/frequencies). The top-level "
               f"'sampling_interval_hours' above ({report['sampling_interval_hours']}h) is "
-              f"only the DOMINANT era's value, for backward compatibility with stages that "
-              f"read that single field as a lag/dt parameter (11b, 13, 24) - those stages "
-              f"are NOT yet era-aware and may use the wrong dt for the non-dominant era(s) "
-              f"of this specific buoy's record.")
+              f"only the DOMINANT era's value - Stages 11b, 13, and 24 use "
+              f"utils.get_dt_hours()/segments_by_time_gap_era_aware() instead of this "
+              f"top-level field directly, so they correctly apply each segment's own "
+              f"era-specific interval. Any OTHER stage reading 'sampling_interval_hours' "
+              f"directly from this file is still getting only the dominant era's value.")
 
 
 if __name__ == "__main__":

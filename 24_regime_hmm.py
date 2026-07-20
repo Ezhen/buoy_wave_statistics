@@ -36,7 +36,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from hmmlearn.hmm import GaussianHMM
 
-from utils import default_paths, all_contiguous_segments
+from utils import default_paths, all_contiguous_segments, get_dt_hours
 
 
 def main():
@@ -54,10 +54,11 @@ def main():
     load_summary_path = Path("pipeline_out/01_load_clean") / f"{args.buoy}_{args.var}_load_summary.json"
 
     hs_full = pd.read_csv(clean_path, index_col=0, parse_dates=True)[args.var]
-    dt_hours = 0.5
+    load_summary = {}
     if load_summary_path.exists():
         with open(load_summary_path) as f:
-            dt_hours = json.load(f).get("sampling_interval_hours", 0.5)
+            load_summary = json.load(f)
+    dt_hours = load_summary.get("sampling_interval_hours", 0.5)  # dominant-era value, header print only
 
     print(f"--- {args.buoy} / {args.var} HMM regime identification ---")
 
@@ -71,6 +72,51 @@ def main():
     if len(segments) == 0:
         print("No segments long enough - stopping.")
         return
+
+    # Determine each segment's own sampling interval - all_contiguous_
+    # segments can return segments from DIFFERENT eras on a multi-era
+    # buoy. Unlike 11b (a post-hoc hours conversion), mixing segments
+    # from different rates INTO THE SAME HMM TRAINING SET is a deeper
+    # problem than a unit-conversion bug: the fitted per-step transition
+    # probabilities themselves would be a blend across rates, since a
+    # "step" means a different real elapsed time in each. Rather than
+    # silently blend, restrict training data to segments matching the
+    # DOMINANT sampling rate among those found (by total covered
+    # samples), and report how much coverage was excluded as a result.
+    seg_dts = [get_dt_hours(load_summary, s.index[0]) if load_summary else dt_hours
+               for s in segments]
+    distinct_dts = sorted(set(seg_dts))
+
+    if len(distinct_dts) > 1:
+        coverage_by_dt = {}
+        for s, d in zip(segments, seg_dts):
+            coverage_by_dt[d] = coverage_by_dt.get(d, 0) + len(s)
+        chosen_dt = max(coverage_by_dt, key=coverage_by_dt.get)
+        kept = [s for s, d in zip(segments, seg_dts) if d == chosen_dt]
+        excluded_samples = sum(len(s) for s, d in zip(segments, seg_dts) if d != chosen_dt)
+        print(f"\nWARNING: segments found span more than one sampling interval "
+              f"({distinct_dts}h) - training an HMM on samples mixed across "
+              f"different real elapsed-time-per-step would blend the fitted "
+              f"transition probabilities in a way that doesn't correspond to "
+              f"a single meaningful timescale. Restricting to the "
+              f"{chosen_dt}h-interval segments only ({sum(len(s) for s in kept)} "
+              f"samples, {coverage_by_dt[chosen_dt]}/{coverage} of segment "
+              f"coverage) - excluding {excluded_samples} samples from a "
+              f"different era. Run this stage on the excluded era's own "
+              f"clean.csv slice separately if its dwell times matter too.")
+        segments = kept
+        dt_hours = chosen_dt
+    else:
+        dt_hours = distinct_dts[0]
+
+    if len(segments) == 0:
+        print("No segments remain at the chosen sampling rate after filtering - stopping.")
+        return
+
+    # Recompute AFTER any era-mixing filtering above, so downstream
+    # reporting (including the saved JSON) reflects what actually went
+    # into the fitted model, not the pre-filter total.
+    coverage = sum(len(s) for s in segments)
 
     X = np.concatenate([s.values for s in segments]).reshape(-1, 1)
     lengths = [len(s) for s in segments]
@@ -106,6 +152,8 @@ def main():
             "n_regimes": args.n_regimes,
             "n_segments_used": len(segments),
             "pct_valid_data_used": round(100 * coverage / total_valid, 1),
+            "dt_hours_used": dt_hours,
+            "distinct_dts_found": distinct_dts,
             "regime_means": means_sorted.tolist(),
             "transition_matrix": transmat_sorted.tolist(),
             "dwell_time_hours": dwell_hours.tolist(),

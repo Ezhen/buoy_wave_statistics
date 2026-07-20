@@ -39,7 +39,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from statsmodels.tsa.seasonal import STL
 
-from utils import default_paths
+from utils import default_paths, emit_warning
 
 
 def build_monthly_series(hs: pd.Series, agg: str):
@@ -95,10 +95,13 @@ def main():
               f"STL needs multiple full annual cycles to estimate seasonality "
               f"at all, let alone reliably.")
         return
+    warnings = []
     if record_years < 10:
-        print(f"NOTE: {record_years:.1f} years clears --min-years but is short "
-              f"for a stable seasonal estimate (10+ years preferred). Treat the "
-              f"seasonal component with real caution.")
+        emit_warning(warnings, "note", "short_record_for_seasonal_estimate",
+                     f"{record_years:.1f} years clears --min-years but is short for a "
+                     f"stable seasonal estimate (10+ years preferred). Treat the seasonal "
+                     f"component with real caution.",
+                     record_years=record_years, preferred_min_years=10)
 
     out_dir = default_paths("15_seasonal_decomposition")
     summary = {"record_years": record_years}
@@ -110,10 +113,15 @@ def main():
         n_total = len(monthly)
         if n_missing > 0:
             frac = n_missing / n_total
-            extra = " NOTE: this is a substantial fraction - treat results with extra caution." if frac > 0.1 else ""
             print(f"  {n_missing}/{n_total} months had no data - linearly "
                   f"interpolated to give STL a complete series (STL cannot "
-                  f"handle NaN).{extra}")
+                  f"handle NaN).")
+            if frac > 0.1:
+                emit_warning(warnings, "warning", "substantial_interpolated_months",
+                             f"[{agg}] {n_missing}/{n_total} ({frac:.1%}) months were "
+                             f"interpolated - a substantial fraction, treat results with "
+                             f"extra caution.",
+                             agg=agg, n_missing=n_missing, n_total=n_total, fraction=frac)
 
         if n_total < 24:
             print(f"  Only {n_total} months - too few for STL (needs >= 24, "
@@ -134,10 +142,50 @@ def main():
         seasonal_var_frac = float(seasonal.var() / total_var) if total_var > 0 else float("nan")
         trend_var_frac = float(trend.var() / total_var) if total_var > 0 else float("nan")
 
+        # Sanity check: Var(monthly) = Var(seasonal) + Var(trend) +
+        # Var(resid) + covariance cross-terms - so a component's OWN
+        # variance fraction exceeding 1.0 (or the two together doing so)
+        # is only possible when components have substantial NEGATIVE
+        # covariance canceling each other out. That's not just "wide
+        # uncertainty from a short record" the way a merely-large
+        # fraction near 1.0 might be - it's a specific, checkable sign
+        # of an unstable/degenerate fit where STL is producing
+        # components that fight each other rather than a coherent
+        # decomposition. Found on real data: Raversijde1Buoy (56
+        # months, barely above STL's 24-month floor) gave a seasonal
+        # fraction of 1.190 - genuinely different in kind from
+        # Raversijde2Buoy's 0.899 at 61 months, not just a slightly
+        # worse version of the same short-record caution.
+        #
+        # TOLERANCE_MARGIN exists because a strict >1.0 comparison
+        # false-positives on legitimate decompositions sitting right at
+        # the floating-point boundary (e.g. a genuinely near-negligible
+        # trend component, not a real instability, can land the
+        # seasonal fraction at 0.999-1.000 purely from rounding) -
+        # confirmed by testing this check against a synthetic
+        # dominant-seasonal-signal case before trusting it on real
+        # data. 1.190 (the real flagged case) clears any reasonable
+        # margin; 1.000 +/- floating-point noise should not.
+        TOLERANCE_MARGIN = 1.02
+        unstable_fit = (seasonal_var_frac > TOLERANCE_MARGIN
+                         or trend_var_frac > TOLERANCE_MARGIN
+                         or (seasonal_var_frac + trend_var_frac) > TOLERANCE_MARGIN)
+
         print(f"  Seasonal amplitude (peak-to-trough): {seasonal_amplitude:.3f} m")
         print(f"  Peak month: {peak_month} ({pd.Timestamp(2000, peak_month, 1).strftime('%B')}), "
               f"trough month: {trough_month} ({pd.Timestamp(2000, trough_month, 1).strftime('%B')})")
         print(f"  Variance fraction - seasonal: {seasonal_var_frac:.3f}, trend: {trend_var_frac:.3f}")
+        if unstable_fit:
+            emit_warning(warnings, "warning", "unstable_stl_decomposition",
+                         f"[{agg}] variance fraction(s) exceed 1.0 (or sum past it) - only "
+                         f"possible via substantial negative covariance between components. "
+                         f"This is a specific sign of an unstable/degenerate STL fit, not "
+                         f"just general short-record uncertainty - treat this buoy's "
+                         f"seasonal decomposition as unreliable, not merely lower-confidence, "
+                         f"and exclude it from cross-buoy comparisons rather than including "
+                         f"it with a caveat.",
+                         agg=agg, seasonal_variance_fraction=seasonal_var_frac,
+                         trend_variance_fraction=trend_var_frac, tolerance_margin=TOLERANCE_MARGIN)
 
         summary[agg] = {
             "n_missing_months": n_missing,
@@ -147,6 +195,7 @@ def main():
             "trough_month": trough_month,
             "seasonal_variance_fraction": seasonal_var_frac,
             "trend_variance_fraction": trend_var_frac,
+            "decomposition_flagged_unstable": unstable_fit,
             "seasonal_by_month": {int(m): float(v) for m, v in by_month.items()},
         }
 
@@ -174,6 +223,8 @@ def main():
         fig.tight_layout()
         fig.savefig(out_dir / f"{args.buoy}_{args.var}_{agg}_seasonal_by_month.png", dpi=150)
         plt.close(fig)
+
+    summary["warnings"] = warnings
 
     with open(out_dir / f"{args.buoy}_{args.var}_seasonal_summary.json", "w") as f:
         json.dump(summary, f, indent=2)

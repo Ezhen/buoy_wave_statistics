@@ -210,3 +210,62 @@ def test_snap_collisions_are_reported_not_silent(stage01):
     total_collisions = sum(e["n_snap_collisions"] for e in report["eras"])
     assert total_collisions >= 0  # field must exist and be well-formed
     assert "n_snap_collisions" in report["eras"][0]
+
+
+# ---------------------------------------------------------------------
+# Case 5: a real rate-change seam with only a SHORT natural gap (no
+# deliberately injected long gap) must still always break contiguity -
+# found via direct empirical test, not theory: a rate change with a
+# short seam concatenated with ZERO NaN marker by default, meaning
+# longest_contiguous_segment (used by Stages 11b, 13, 24, 26) would
+# silently splice two different sampling rates into one "contiguous"
+# segment. Reproduces the exact real Zeebrugge seam timing (era1 ends
+# 09:30, era2 begins 10:15 - a 45-minute natural gap).
+# ---------------------------------------------------------------------
+def _short_seam_rate_change_series(seed=40):
+    rng = np.random.default_rng(seed)
+    era1 = pd.date_range("2017-01-01 00:00", "2017-10-16 09:30:00", freq="15min")
+    era2 = pd.date_range("2017-10-16 10:15:00", "2018-06-01 00:00:00", freq="30min")
+    idx = era1.append(era2)
+    vhm0 = np.clip(1.0 + rng.normal(0, 0.2, len(idx)), 0.05, None)
+    return pd.Series(vhm0, index=idx, name="VHM0")
+
+
+def test_era_boundary_always_breaks_contiguity(stage01):
+    """The core bug: a short natural seam between two eras must not be
+    silently bridged. Must insert an explicit break even when no long
+    gap already separates the two rates."""
+    s = _short_seam_rate_change_series()
+    s_clean, report = stage01.regularize_and_clean(s, "VHM0")
+    assert report["n_era_boundary_markers"] >= 1
+
+    seam_window = s_clean["2017-10-16 09:00:00":"2017-10-16 11:00:00"]
+    assert seam_window.isna().any(), (
+        "no NaN break found spanning the era transition - a contiguous-"
+        "segment check would silently splice two different sampling "
+        "rates together"
+    )
+
+
+def test_era_boundary_respected_by_longest_contiguous_segment(stage01):
+    """The actual consumer-facing guarantee: longest_contiguous_segment
+    must stop at the era boundary, not just 'a NaN exists somewhere
+    nearby' - this is what 11b/13/24/26 actually rely on."""
+    sys.path.insert(0, str(REPO_ROOT))
+    import utils  # noqa: E402 - path bootstrap must run first
+
+    s = _short_seam_rate_change_series()
+    s_clean, _ = stage01.regularize_and_clean(s, "VHM0")
+    segment, meta = utils.longest_contiguous_segment(s_clean)
+
+    era_boundary_start = pd.Timestamp("2017-10-16 09:30:00")
+    era_boundary_end = pd.Timestamp("2017-10-16 10:15:00")
+    spans_boundary = (
+        segment.index.min() <= era_boundary_start
+        and segment.index.max() >= era_boundary_end
+    )
+    assert not spans_boundary, (
+        "longest_contiguous_segment returned a segment spanning the era "
+        "boundary - it would mix two different sampling rates under one "
+        "dt_hours assumption"
+    )

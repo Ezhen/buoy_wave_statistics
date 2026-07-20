@@ -154,6 +154,126 @@ def longest_contiguous_segment(series: pd.Series):
     return longest, meta
 
 
+def stage_eligible(requirements: dict, buoy_info: dict):
+    """Check whether a buoy meets a stage's declared requirements.
+    Originally lived in run_all_buoys.py; relocated here (pure move, no
+    behavior change) so tools/run_stage.py can share the exact same
+    eligibility logic instead of reimplementing it - two independent
+    copies of this check would be exactly the kind of duplicated-logic
+    drift risk the stage/buoy registries exist to eliminate.
+
+    requirements is one of:
+      {}                                    -> Core, always eligible
+      {"variables_any": ["VTPK", "VMDR"]}   -> eligible if buoy has at least one
+      {"variables_all": ["VTPK"]}           -> eligible if buoy has all listed
+      {"min_record_years": 2.0}             -> eligible once record is long enough
+    Multiple keys may be combined; all present conditions must pass.
+    """
+    if not requirements:
+        return True, None
+    available = set(buoy_info.get("available_variables", []))
+    if "variables_any" in requirements:
+        needed = requirements["variables_any"]
+        if not any(v in available for v in needed):
+            return False, f"needs one of {needed}, buoy only has {sorted(available)}"
+    if "variables_all" in requirements:
+        needed = requirements["variables_all"]
+        missing = [v for v in needed if v not in available]
+        if missing:
+            return False, f"missing required variable(s) {missing}"
+    if "min_record_years" in requirements:
+        years = buoy_info.get("record_years", 0.0)
+        if years < requirements["min_record_years"]:
+            return False, f"record is {years:.3f} years, needs >= {requirements['min_record_years']}"
+    return True, None
+
+
+def emit_warning(warnings_list: list, severity: str, code: str, message: str, **context):
+    """Append a structured, machine-readable warning/note/info entry to
+    a stage's own accumulating list, AND print it - one call site
+    instead of stages maintaining two separate code paths (a console
+    print for humans, a separate ad hoc field for the JSON).
+
+    This formalizes a pattern that was already happening informally
+    throughout the pipeline (Stage 01's multi-era NOTE, Stage 15's
+    variance-fraction WARNING, Stage 25's storm-season-coverage
+    cross-check) - every one of those was console-only free text, with
+    no structured record of WHAT was flagged or WHY, so a downstream
+    consumer (a future cross-buoy assumption-tracking report, or just
+    someone re-reading a saved JSON later) had no way to check "did
+    this buoy trip any known caveats" without re-parsing printed text.
+
+    `code` should be a short, stable, machine-readable identifier (e.g.
+    "seasonal_variance_fraction_exceeds_bound") - stable across runs,
+    so a downstream consumer can filter/count by code rather than by
+    matching free-text message strings, which drift as wording is
+    edited. `context` holds any structured values relevant to the
+    specific warning (e.g. the actual fraction value that tripped a
+    threshold) - optional, but strongly preferred over embedding the
+    only copy of a number inside the message string.
+
+    Retrofit incrementally as stages get touched, not all at once -
+    added here first to 15_seasonal_decomposition.py and
+    25_changepoint_detection.py, which already had ad hoc console
+    NOTE/WARNING text this replaces.
+    """
+    entry = {"severity": severity, "code": code, "message": message}
+    if context:
+        entry["context"] = context
+    warnings_list.append(entry)
+    prefix = {"warning": "WARNING", "note": "NOTE", "info": "INFO"}.get(severity, severity.upper())
+    print(f"{prefix}: {message}")
+    return entry
+
+
+def get_dt_hours(load_summary: dict, segment_start_ts) -> float:
+    """Era-aware lookup for a buoy's sampling interval, given the START
+    TIMESTAMP of a specific analysis segment (e.g. from
+    longest_contiguous_segment or all_contiguous_segments) - NOT a
+    single value for the whole record. A multi-era buoy genuinely has a
+    different native interval in different parts of its history
+    (Stage 01's own `load_summary.json["sampling_interval_hours"]` only
+    reports the DOMINANT era's value, for backward compatibility with
+    stages that haven't been made era-aware yet).
+
+    Falls back to that single top-level field for single-era buoys or
+    older-format summaries without an 'eras' list, so single-era
+    behavior (the common case - 11 of 19 buoys) is completely
+    unchanged.
+
+    SAFETY REQUIREMENT: this is only correct if the segment cannot span
+    two eras - which depends on Stage 01's era-boundary-marker
+    guarantee (every era transition always breaks NaN-based contiguity,
+    even without a natural time gap between the two rates). Without
+    that guarantee, a segment from longest_contiguous_segment could
+    silently mix two sampling rates, and this function would have no
+    way to know - it trusts the segment is genuinely single-rate and
+    just looks up which era it falls in. Raises rather than guesses if
+    the segment's start doesn't fall inside any reported era window,
+    since a silently wrong dt_hours here would corrupt every downstream
+    lag-based calculation that uses it (persistence timescale, ACF-based
+    block length, HMM transition timing).
+    """
+    eras = load_summary.get("eras")
+    if not eras:
+        return load_summary.get("sampling_interval_hours", 0.5)
+
+    ts = pd.Timestamp(segment_start_ts)
+    for era in eras:
+        era_start = pd.Timestamp(era["start"])
+        era_end = pd.Timestamp(era["end"])
+        if era_start <= ts <= era_end:
+            return era["inferred_freq_hours"]
+
+    raise ValueError(
+        f"segment start {ts} does not fall within any era window in "
+        f"load_summary (eras span: "
+        f"{[(e['start'], e['end']) for e in eras]}) - check for a stale "
+        f"load_summary.json (rerun Stage 01) before assuming this is a "
+        f"genuine bug."
+    )
+
+
 def all_contiguous_segments(series: pd.Series, min_length: int = 1):
     """Like longest_contiguous_segment but returns every contiguous
     non-NaN run at least min_length samples long, sorted longest-first.
@@ -201,6 +321,45 @@ def segments_by_time_gap(series: pd.Series, dt_hours: float, gap_multiplier: flo
         start = bp
     segments.append(series.iloc[start:])
     return segments
+
+
+def segments_by_time_gap_era_aware(series: pd.Series, load_summary: dict, gap_multiplier: float = 1.5):
+    """Era-aware version of segments_by_time_gap - a single shared
+    dt_hours threshold can't correctly serve a multi-era buoy: too
+    small (finer era's dt) over-fragments the coarser era on ordinary
+    sampling gaps; too large (coarser era's dt) can let genuine small
+    gaps within the finer era go undetected, silently bridging two
+    temporally disconnected periods as one segment. Worse, neither
+    choice is GUARANTEED to correctly break at the era boundary itself
+    - that depends on whether the transition's natural seam happens to
+    exceed gap_multiplier*dt for whichever dt got used, which isn't
+    reliable in general (a small transition seam could fail to clear a
+    dominant-era threshold, merging two different sampling rates into
+    one "segment" - worse than misjudging gaps within a single rate).
+
+    Sidesteps all of this by running gap-detection independently within
+    each era's own KNOWN date range (from load_summary), using that
+    era's own dt - the era boundary is never even evaluated by a single
+    segments_by_time_gap call, since no call ever sees data from two
+    eras at once.
+
+    Falls back to the plain single-value function for single-era
+    summaries (the common case - unchanged behavior)."""
+    eras = load_summary.get("eras")
+    if not eras:
+        dt_hours = load_summary.get("sampling_interval_hours", 0.5)
+        return segments_by_time_gap(series, dt_hours, gap_multiplier)
+
+    all_segments = []
+    for era in eras:
+        era_start = pd.Timestamp(era["start"])
+        era_end = pd.Timestamp(era["end"])
+        era_slice = series[(series.index >= era_start) & (series.index <= era_end)]
+        if len(era_slice) == 0:
+            continue
+        era_dt = era["inferred_freq_hours"]
+        all_segments.extend(segments_by_time_gap(era_slice, era_dt, gap_multiplier))
+    return all_segments
 
 
 def load_era5_for_buoy(lat: float, lon: float, era5_dir: str = "meteo_era5"):
